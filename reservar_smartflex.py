@@ -144,6 +144,53 @@ def reserva_activa(documento):
         return None
 
 
+def fecha_de_reserva(b):
+    """
+    Fecha y hora de una reserva. La API devuelve fecha_clase en DD/MM/YYYY y
+    hora_clase en 12 horas; isoBogota es mas confiable cuando viene.
+    Devuelve None si no se puede interpretar.
+    """
+    if not b:
+        return None
+
+    iso = b.get("isoBogota")
+    if iso:
+        try:
+            return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(TZ)
+        except ValueError:
+            pass
+
+    fecha = str(b.get("fecha_clase", "")).strip()
+    hora = str(b.get("hora_clase", "")).strip().upper()
+    for fmt in ("%d/%m/%Y %I:%M %p", "%Y-%m-%d %I:%M %p",
+                "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(f"{fecha} {hora}", fmt).replace(tzinfo=TZ)
+        except ValueError:
+            continue
+
+    log(f"No pude interpretar la fecha de la reserva: {fecha!r} {hora!r}")
+    return None
+
+
+def ya_paso(b):
+    """
+    True si la clase ya ocurrio. El sistema sigue reportando como 'activas'
+    las reservas vencidas, asi que estas no deben bloquear una nueva.
+    Ante la duda (fecha ilegible) devuelve False y deja que decida el servidor.
+    """
+    cuando = fecha_de_reserva(b)
+    if cuando is None:
+        return False
+    # Media hora de gracia por si la clase esta empezando justo ahora.
+    return cuando < datetime.now(TZ) - timedelta(minutes=30)
+
+
+def bloqueante(b):
+    """La reserva solo estorba si todavia no ha ocurrido."""
+    return b if (b and not ya_paso(b)) else None
+
+
 def describir(b):
     return (f"{b.get('subnivel','')} clase {b.get('clase','')} - "
             f"{b.get('fecha_clase','')} {b.get('hora_clase','')}")
@@ -289,13 +336,17 @@ def modo_preguntar(cfg, estado, documento):
     objetivo = datetime.now(TZ) + timedelta(days=dias + 1)
 
     activa = reserva_activa(documento)
-    if activa:
+    if bloqueante(activa):
         enviar("Recordatorio: ya tienes una reserva activa\n"
                f"{describir(activa)}\n\n"
                "El sistema solo permite una a la vez, asi que esta noche no puedo "
                "programar otra. Escribeme 'cancelar' si quieres liberarla.")
         return
 
+    if activa:
+        log(f"Reserva vencida ignorada: {describir(activa)}")
+
+    # Aunque ya haya pasado, sirve para saber en que clase vas.
     subnivel, clase, fin_subnivel = proxima_clase(cfg, estado, activa)
 
     if fin_subnivel:
@@ -349,7 +400,7 @@ def modo_reservar(cfg, estado, documento):
         sys.exit(1)
     nombre = sesion.get("nombreCompleto", "")
 
-    if activa_previa:
+    if bloqueante(activa_previa):
         enviar(f"No reserve: ya tienes una reserva activa\n{describir(activa_previa)}")
         return
 
@@ -401,6 +452,11 @@ def cancelar(documento, estado):
     activa = reserva_activa(documento)
     if not activa:
         enviar("No tienes ninguna reserva activa para cancelar.")
+        return
+
+    if ya_paso(activa):
+        enviar(f"No cancele nada: esa clase ya se dicto.\n{describir(activa)}\n"
+               "El sistema la sigue mostrando, pero no te bloquea para reservar otra.")
         return
 
     res = api_post("cancel",
