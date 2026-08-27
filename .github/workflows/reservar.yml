@@ -1,0 +1,39 @@
+name: 2. Reservar la clase
+
+on:
+  schedule:
+    # 12:15 a.m. hora Bogota = 05:15 UTC del mismo dia.
+    - cron: "15 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  reservar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install requests
+      - env:
+          SMARTFLEX_DOC: ${{ secrets.SMARTFLEX_DOC }}
+          SMARTFLEX_EMAIL: ${{ secrets.SMARTFLEX_EMAIL }}
+          SMARTFLEX_DEVICE_ID: ${{ secrets.SMARTFLEX_DEVICE_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python reservar_smartflex.py --modo reservar
+
+      - name: Guardar estado
+        if: always()
+        run: |
+          if [[ -n "$(git status --porcelain estado.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add estado.json
+            git commit -m "estado: actualizar tras reservar"
+            git pull --rebase --autostash
+            git push
+          fi
