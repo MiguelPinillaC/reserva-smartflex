@@ -326,11 +326,16 @@ def objetivo_de_la_proxima_corrida(cfg):
 
 
 def pendiente_valido(estado, cfg):
-    """La intencion anotada, si sigue vigente para la proxima corrida."""
+    """
+    La intencion anotada, si su fecha objetivo sigue en el futuro.
+    Se compara contra la fecha que ella misma guardo, nunca recalculando
+    la proxima corrida: al ejecutarse a las 00:15 el calculo daria un dia mas.
+    """
     p = estado.get("pendiente")
     if not p:
         return None
-    if p.get("para") != objetivo_de_la_proxima_corrida(cfg).strftime("%Y-%m-%d"):
+    hoy = datetime.now(TZ).strftime("%Y-%m-%d")
+    if str(p.get("para", "")) <= hoy:
         log(f"Intencion vencida (era para {p.get('para')}), la descarto.")
         return None
     return p
@@ -480,8 +485,9 @@ def modo_preguntar(cfg, estado, documento):
     """A las 8 p.m. Solo molesta si no le has pedido nada."""
     p = pendiente_valido(estado, cfg)
     if p:
+        cuando = datetime.strptime(p["para"], "%Y-%m-%d").replace(tzinfo=TZ)
         enviar(f"Recordatorio: ya tienes anotado {p['subnivel']} clase {p['clase']} "
-               f"a las {p['hora']} para el {fecha_bonita(objetivo_de_la_proxima_corrida(cfg))}.\n"
+               f"a las {p['hora']} para el {fecha_bonita(cuando)}.\n"
                "Lo reservo en la madrugada. Escribeme 'no reservar' si cambiaste de idea.")
         return
 
@@ -493,22 +499,24 @@ def modo_reservar(cfg, estado, documento):
     p = pendiente_valido(estado, cfg)
 
     # Respaldo: si el workflow de escuchar no corrio, leo el chat directamente.
+    # Solo mensajes que ninguna corrida haya procesado antes, para no repetir
+    # la reserva de anoche con el mismo mensaje viejo.
     if not p:
-        respuesta = None
-        limite = time.time() - float(cfg.get("ventana_respuesta_horas", 5)) * 3600
-        for m in reversed(mensajes_mios(obtener_updates())):
-            if m["fecha"] < limite:
-                break
-            respuesta = m["texto"]
-            break
-        if respuesta:
+        ultimo_visto = int(estado.get("ultimo_update_procesado", 0))
+        limite = time.time() - float(cfg.get("ventana_respuesta_horas", 24)) * 3600
+        nuevos = [m for m in mensajes_mios(obtener_updates())
+                  if m["id"] > ultimo_visto and m["fecha"] >= limite]
+        if nuevos:
+            estado["ultimo_update_procesado"] = max(m["id"] for m in nuevos)
             activa = reserva_activa(documento)
             s, c, _ = proxima_clase(cfg, estado, activa)
-            params, veredicto = interpretar(respuesta, dict(cfg, subnivel=s, clase=c))
+            params, veredicto = interpretar(nuevos[-1]["texto"], dict(cfg, subnivel=s, clase=c))
             if veredicto == "si":
                 log("Sin intencion anotada, pero encontre tu mensaje en el chat.")
+                objetivo = datetime.now(TZ) + timedelta(days=int(cfg.get("dias_adelante", 1)))
                 p = {"subnivel": params["subnivel"], "clase": str(params["clase"]),
-                     "hora": params["hora"]}
+                     "hora": params["hora"], "para": objetivo.strftime("%Y-%m-%d")}
+            guardar_estado(estado)
 
     if not p:
         if cfg.get("avisar_si_no_hubo_respuesta", True):
@@ -516,10 +524,9 @@ def modo_reservar(cfg, estado, documento):
         return
 
     subnivel, clase, hora = p["subnivel"], str(p["clase"]), p["hora"]
-    dias = int(cfg.get("dias_adelante", 1))
     alternativa = bool(cfg.get("reservar_alternativa", False))
-    objetivo = datetime.now(TZ) + timedelta(days=dias)
-    fecha = objetivo.strftime("%Y-%m-%d")
+    fecha = p["para"]
+    objetivo = datetime.strptime(fecha, "%Y-%m-%d").replace(tzinfo=TZ)
 
     email = os.environ.get("SMARTFLEX_EMAIL", "").strip()
     if not email:
