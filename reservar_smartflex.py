@@ -325,20 +325,29 @@ def objetivo_de_la_proxima_corrida(cfg):
     return corrida + timedelta(days=dias)
 
 
-def pendiente_valido(estado, cfg):
-    """
-    La intencion anotada, si su fecha objetivo sigue en el futuro.
-    Se compara contra la fecha que ella misma guardo, nunca recalculando
-    la proxima corrida: al ejecutarse a las 00:15 el calculo daria un dia mas.
-    """
+def pendiente_vigente(estado):
+    """La intencion anotada, si su fecha objetivo sigue en el futuro."""
     p = estado.get("pendiente")
     if not p:
         return None
-    hoy = datetime.now(TZ).strftime("%Y-%m-%d")
-    if str(p.get("para", "")) <= hoy:
+    if str(p.get("para", "")) <= datetime.now(TZ).strftime("%Y-%m-%d"):
         log(f"Intencion vencida (era para {p.get('para')}), la descarto.")
         return None
     return p
+
+
+def fecha_que_abre_hoy(cfg):
+    """
+    El dia cuyos cupos se liberan en la corrida de hoy. Si la reserva se hace
+    a las 00:15 del viernes para el sabado, dias_adelante es 1.
+    """
+    dias = int(cfg.get("dias_adelante", 1))
+    return (datetime.now(TZ) + timedelta(days=dias)).strftime("%Y-%m-%d")
+
+
+# Alias conservado para el resto del codigo.
+def pendiente_valido(estado, cfg):
+    return pendiente_vigente(estado)
 
 
 def anotar(estado, cfg, subnivel, clase, hora):
@@ -496,11 +505,23 @@ def modo_preguntar(cfg, estado, documento):
 
 
 def modo_reservar(cfg, estado, documento):
-    p = pendiente_valido(estado, cfg)
+    objetivo_hoy = fecha_que_abre_hoy(cfg)
+    ahora = datetime.now(TZ)
+    programada = str(cfg.get("hora_corrida_reserva", "00:15"))
+    log(f"Corrida real: {ahora:%H:%M} (programada {programada}). "
+        f"Hoy se liberan los cupos del {objetivo_hoy}.")
 
-    # Respaldo: si el workflow de escuchar no corrio, leo el chat directamente.
-    # Solo mensajes que ninguna corrida haya procesado antes, para no repetir
-    # la reserva de anoche con el mismo mensaje viejo.
+    p = pendiente_vigente(estado)
+
+    # Una intencion para otro dia NO se toca: le corresponde a otra corrida.
+    if p and p["para"] != objetivo_hoy:
+        log(f"La intencion es para el {p['para']}, no para el {objetivo_hoy}. La dejo intacta.")
+        enviar(f"Hoy se liberan los cupos del {objetivo_hoy}, pero tu reserva "
+               f"anotada es para el {p['para']}. No toque nada: la hago esa madrugada.")
+        return
+
+    # Respaldo: si el listener no corrio, leo el chat directamente.
+    # Solo mensajes que ninguna corrida haya procesado antes.
     if not p:
         ultimo_visto = int(estado.get("ultimo_update_procesado", 0))
         limite = time.time() - float(cfg.get("ventana_respuesta_horas", 24)) * 3600
@@ -513,9 +534,8 @@ def modo_reservar(cfg, estado, documento):
             params, veredicto = interpretar(nuevos[-1]["texto"], dict(cfg, subnivel=s, clase=c))
             if veredicto == "si":
                 log("Sin intencion anotada, pero encontre tu mensaje en el chat.")
-                objetivo = datetime.now(TZ) + timedelta(days=int(cfg.get("dias_adelante", 1)))
                 p = {"subnivel": params["subnivel"], "clase": str(params["clase"]),
-                     "hora": params["hora"], "para": objetivo.strftime("%Y-%m-%d")}
+                     "hora": params["hora"], "para": objetivo_hoy}
             guardar_estado(estado)
 
     if not p:
@@ -573,7 +593,8 @@ def modo_reservar(cfg, estado, documento):
                     extra = "" if hora_final == hora else f"\n(no habia a las {hora}, tome esta)"
                     enviar(f"RESERVADO\n{subnivel} clase {clase}\n"
                            f"{fecha_bonita(objetivo)} a las {hora_final}\n"
-                           f"id: {res.get('bookingId','')}{extra}")
+                           f"id: {res.get('bookingId','')}{extra}\n"
+                           f"(ejecutado {datetime.now(TZ):%H:%M})")
                     return
                 if res.get("booking"):
                     enviar("No reserve: el sistema reporta una reserva activa tuya.")
@@ -591,7 +612,8 @@ def modo_reservar(cfg, estado, documento):
 
     olvidar(estado)
     enviar(f"NO RESERVADO\n{subnivel} clase {clase} - {fecha_bonita(objetivo)} a las {hora}\n"
-           f"Motivo: {ultimo_error}")
+           f"Motivo: {ultimo_error}\n"
+           f"(ejecutado {datetime.now(TZ):%H:%M})")
 
 
 def main():
