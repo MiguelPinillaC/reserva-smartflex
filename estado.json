@@ -1,6 +1,12 @@
 {
   "ultima_clase_reservada": null,
   "subnivel": "A1.2",
-  "ultimo_update_procesado": 309237224,
-  "pendiente": null
+  "ultimo_update_procesado": 309237225,
+  "pendiente": {
+    "subnivel": "A1.2",
+    "clase": "11",
+    "hora": "17:00",
+    "para": "2026-08-29",
+    "creado": 1787876897
+  }
 }
