@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Reserva Smart Flex — el chat manda.
+Reserva Smart Flex — reserva inmediata por chat.
 
-Le escribes al bot a cualquier hora. Si le dices una hora, anota tu intencion
-y la ejecuta en la madrugada. Si le escribes cualquier otra cosa, te muestra
-el menu con lo que puede hacer.
+El sistema del curso no deja programar una clase nueva mientras tengas otra
+sin ver. Como las clases son de 7 a 9 p.m., a medianoche siempre hay una
+pendiente: por eso reservar de madrugada nunca fue posible. El momento util
+es justo despues de terminar la clase.
 
-  --modo escuchar    (cada 10 min)  Atiende lo que le escribas.
-  --modo preguntar   (8:00 p.m.)    Solo pregunta si no le pediste nada aun.
-  --modo reservar    (12:15 a.m.)   Ejecuta lo que quedo anotado.
+  --modo escuchar   (cada minuto)  Atiende tus mensajes y reserva de una.
+                                   Tambien ejecuta las citas que dejaste puestas.
+  --modo recordar   (9:20 p.m.)    Si no has programado la de manana, pregunta.
 
-Nada se reserva ni se cancela sin que tu lo hayas pedido.
+Que le puedes escribir:
 
-Secrets obligatorios: SMARTFLEX_DOC, SMARTFLEX_EMAIL, TELEGRAM_TOKEN,
-TELEGRAM_CHAT_ID. Opcional: SMARTFLEX_DEVICE_ID.
+  19:00                      reserva la clase siguiente manana a esa hora
+  clase 12 7pm               clase y hora especificas
+  lunes 7pm                  para un dia concreto
+  entra el domingo 00:15     deja una cita: entra ese dia y reserva
+  cancelar / estado / hola
 
-El repositorio es publico, asi que NADA personal va en los archivos:
-documento y correo viven solo en los secrets de GitHub.
+Secrets: SMARTFLEX_DOC, SMARTFLEX_EMAIL, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID.
+Opcional: SMARTFLEX_DEVICE_ID.
 """
 
 import argparse
@@ -26,7 +30,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -38,7 +42,7 @@ API = ("https://script.google.com/macros/s/"
 TZ = ZoneInfo("America/Bogota")
 TIMEOUT = 20
 INTENTOS = 3
-ESPERA = 20
+ESPERA = 15
 
 CONFIG_FILE = Path("config.json")
 ESTADO_FILE = Path("estado.json")
@@ -46,8 +50,6 @@ DEVICE_FILE = Path(".device_id")
 
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-# En un repositorio publico los logs de Actions los puede leer cualquiera.
 DETALLE = os.environ.get("LOG_DETALLADO") == "1"
 
 DIAS = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
@@ -69,21 +71,6 @@ def fecha_bonita(d):
     return f"{DIAS[d.weekday()]} {d.day} de {MESES[d.month - 1]}"
 
 
-def cargar(path, defecto):
-    if path.exists():
-        try:
-            return {**defecto, **json.loads(path.read_text(encoding="utf-8"))}
-        except ValueError:
-            log(f"{path} ilegible, uso valores por defecto.")
-    return dict(defecto)
-
-
-def guardar_estado(estado):
-    ESTADO_FILE.write_text(json.dumps(estado, indent=2, ensure_ascii=False) + "\n",
-                           encoding="utf-8")
-    log("estado.json actualizado")
-
-
 def enviar(texto, botones=None):
     log("-> " + (texto.replace("\n", " | ") if DETALLE else texto.split("\n")[0]))
     if not TG_TOKEN or not TG_CHAT:
@@ -92,14 +79,19 @@ def enviar(texto, botones=None):
     if botones:
         cuerpo["reply_markup"] = {
             "keyboard": [[{"text": b} for b in fila] for fila in botones],
-            "one_time_keyboard": True,
-            "resize_keyboard": True,
+            "one_time_keyboard": True, "resize_keyboard": True,
         }
     try:
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                       json=cuerpo, timeout=TIMEOUT)
     except requests.RequestException as e:
         log(f"No pude enviar el mensaje: {e}")
+
+
+def guardar_estado(estado):
+    ESTADO_FILE.write_text(json.dumps(estado, indent=2, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+    log("estado.json actualizado")
 
 
 def device_id():
@@ -113,6 +105,58 @@ def device_id():
     return nuevo
 
 
+# ---------------------------------------------------------- festivos
+
+def _pascua(anio):
+    a = anio % 19; b = anio // 100; c = anio % 100
+    d = b // 4; e = b % 4; f = (b + 8) // 25
+    g = (b - f + 1) // 3; h = (19 * a + b - d - g + 15) % 30
+    i = c // 4; k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mes = (h + l - 7 * m + 114) // 31
+    dia = ((h + l - 7 * m + 114) % 31) + 1
+    return date(anio, mes, dia)
+
+
+def _lunes_siguiente(d):
+    """Ley Emiliani: si no cae lunes, se traslada al lunes siguiente."""
+    return d + timedelta(days=(7 - d.weekday()) % 7)
+
+
+def festivos_colombia(anio):
+    p = _pascua(anio)
+    fijos = [date(anio, 1, 1), date(anio, 5, 1), date(anio, 7, 20),
+             date(anio, 8, 7), date(anio, 12, 8), date(anio, 12, 25)]
+    emiliani = [date(anio, 1, 6), date(anio, 3, 19), date(anio, 6, 29),
+                date(anio, 8, 15), date(anio, 10, 12), date(anio, 11, 1),
+                date(anio, 11, 11)]
+    santos = [p - timedelta(days=3), p - timedelta(days=2)]
+    moviles = [p + timedelta(days=43), p + timedelta(days=64), p + timedelta(days=71)]
+    return set(fijos + santos
+               + [_lunes_siguiente(d) for d in emiliani]
+               + [_lunes_siguiente(d) for d in moviles])
+
+
+def sin_clases(d, cfg):
+    """Domingos y festivos colombianos. Devuelve el motivo, o None."""
+    dia = d.date() if isinstance(d, datetime) else d
+    if dia.weekday() == 6 and cfg.get("sin_clases_domingo", True):
+        return "es domingo"
+    if cfg.get("sin_clases_festivos", True) and dia in festivos_colombia(dia.year):
+        return "es festivo en Colombia"
+    return None
+
+
+def proximo_dia_habil(desde, cfg):
+    d = desde
+    for _ in range(14):
+        if not sin_clases(d, cfg):
+            return d
+        d += timedelta(days=1)
+    return desde
+
+
 # ---------------------------------------------------------- API de reservas
 
 def api_get(action, **params):
@@ -122,21 +166,16 @@ def api_get(action, **params):
 
 
 def api_post(action, **payload):
-    r = requests.post(
-        API,
-        params={"api": "1"},
-        headers={"Content-Type": "text/plain;charset=utf-8"},
-        data=json.dumps({"action": action, **payload}),
-        timeout=TIMEOUT,
-    )
+    r = requests.post(API, params={"api": "1"},
+                      headers={"Content-Type": "text/plain;charset=utf-8"},
+                      data=json.dumps({"action": action, **payload}), timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
 def reserva_activa(documento):
     try:
-        r = api_get("verifyStudentBooking", documento=documento)
-        return r.get("booking")
+        return api_get("verifyStudentBooking", documento=documento).get("booking")
     except (requests.RequestException, ValueError) as e:
         log(f"No pude consultar la reserva activa: {e}")
         return None
@@ -148,7 +187,6 @@ def describir(b):
 
 
 def fecha_de_reserva(b):
-    """La API da fecha_clase en DD/MM/YYYY y hora_clase en 12 horas."""
     if not b:
         return None
     iso = b.get("isoBogota")
@@ -157,12 +195,12 @@ def fecha_de_reserva(b):
             return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(TZ)
         except ValueError:
             pass
-    fecha = str(b.get("fecha_clase", "")).strip()
-    hora = str(b.get("hora_clase", "")).strip().upper()
+    f = str(b.get("fecha_clase", "")).strip()
+    h = str(b.get("hora_clase", "")).strip().upper()
     for fmt in ("%d/%m/%Y %I:%M %p", "%Y-%m-%d %I:%M %p",
                 "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(f"{fecha} {hora}", fmt).replace(tzinfo=TZ)
+            return datetime.strptime(f"{f} {h}", fmt).replace(tzinfo=TZ)
         except ValueError:
             continue
     log("No pude interpretar la fecha de la reserva")
@@ -170,16 +208,33 @@ def fecha_de_reserva(b):
 
 
 def ya_paso(b):
-    """El sistema sigue reportando como activas las reservas vencidas."""
+    """El sistema sigue reportando como activas las clases ya dictadas."""
     cuando = fecha_de_reserva(b)
-    if cuando is None:
-        return False
-    return cuando < datetime.now(TZ) - timedelta(minutes=30)
+    return False if cuando is None else cuando < datetime.now(TZ) - timedelta(minutes=30)
 
 
 def bloqueante(b):
-    """Solo estorba una reserva que todavia no ha ocurrido."""
     return b if (b and not ya_paso(b)) else None
+
+
+def hora_del_slot(slot):
+    iso = slot.get("isoBogota")
+    if iso:
+        try:
+            return (datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                    .astimezone(TZ).strftime("%H:%M"))
+        except ValueError:
+            pass
+    bruto = (slot.get("timeLabel") or slot.get("timeStr") or "").strip()
+    p = bruto.split(":")
+    return f"{int(p[0]):02d}:{p[1][:2]}" if len(p) >= 2 and p[0].strip().isdigit() else bruto
+
+
+def obtener_slots(subnivel, fecha):
+    slots = api_get("getSlotsForDate", subnivel=subnivel, dateStr=fecha)
+    if isinstance(slots, dict):
+        slots = slots.get("slots") or slots.get("result") or []
+    return slots or []
 
 
 # ---------------------------------------------------------- Telegram entrante
@@ -205,94 +260,90 @@ def mensajes_mios(updates):
         texto = (msg.get("text") or "").strip()
         if texto:
             salida.append({"id": u.get("update_id", 0),
-                           "fecha": msg.get("date", 0),
-                           "texto": texto})
+                           "fecha": msg.get("date", 0), "texto": texto})
     if salida:
-        log(f"<- {len(salida)} mensaje(s) tuyos"
+        log(f"<- {len(salida)} mensaje(s)"
             + (f": {[m['texto'] for m in salida]}" if DETALLE else ""))
     return salida
 
 
+# ---------------------------------------------------------- interpretacion
+
+def interpretar_hora(t):
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
+    if m:
+        h = int(m.group(1)) % 12
+        return f"{h + (12 if m.group(2) == 'pm' else 0):02d}:00"
+    return None
+
+
+def interpretar_dia(t, ahora=None):
+    """'manana', 'lunes', '29/08', '29'. Devuelve date o None."""
+    ahora = ahora or datetime.now(TZ)
+    hoy = ahora.date()
+
+    if re.search(r"pasado\s*ma[nñ]ana", t):
+        return hoy + timedelta(days=2)
+    if re.search(r"\bma[nñ]ana\b", t):
+        return hoy + timedelta(days=1)
+    if re.search(r"\bhoy\b", t):
+        return hoy
+
+    for i, nombre in enumerate(DIAS):
+        patron = nombre.replace("miercoles", "mi[eé]rcoles").replace("sabado", "s[aá]bado")
+        if re.search(rf"\b{patron}\b", t):
+            delta = (i - hoy.weekday()) % 7
+            return hoy + timedelta(days=delta or 7)
+
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", t)
+    if m:
+        d, mes = int(m.group(1)), int(m.group(2))
+        try:
+            cand = date(hoy.year, mes, d)
+            return cand if cand >= hoy else date(hoy.year + 1, mes, d)
+        except ValueError:
+            return None
+    return None
+
+
 def interpretar(texto, base):
-    """
-    Devuelve (parametros, veredicto) donde veredicto es:
-      "si" -> quiere reservar, con lo que haya especificado
-      "no" -> dijo explicitamente que no
-      "?"  -> no se entiende como una orden de reserva
-    """
+    """Devuelve (parametros, veredicto) con veredicto 'si' / 'no' / '?'."""
     cfg = dict(base)
     t = texto.lower().strip()
 
     if re.search(r"(no reservar|no gracias|saltar|omitir|^no\b|^nel\b)", t):
         return cfg, "no"
 
-    reconocio = False
-
+    ok = False
     m = re.search(r"\b([a-c][12]\.\d)\b", t)
     if m:
-        cfg["subnivel"] = m.group(1).upper()
-        reconocio = True
-
+        cfg["subnivel"] = m.group(1).upper(); ok = True
     m = re.search(r"clase\s*(\d+)", t)
     if m:
-        cfg["clase"] = m.group(1)
-        reconocio = True
-
-    m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
-    if m:
-        cfg["hora"] = f"{int(m.group(1)):02d}:{m.group(2)}"
-        reconocio = True
-    else:
-        m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
-        if m:
-            h = int(m.group(1)) % 12
-            if m.group(2) == "pm":
-                h += 12
-            cfg["hora"] = f"{h:02d}:00"
-            reconocio = True
-
+        cfg["clase"] = m.group(1); ok = True
+    h = interpretar_hora(t)
+    if h:
+        cfg["hora"] = h; ok = True
+    d = interpretar_dia(t)
+    if d:
+        cfg["fecha"] = d.strftime("%Y-%m-%d"); ok = True
     if re.search(r"\b(si|sí|dale|listo|ok|claro|reserva|reservar|programa|programar)\b", t):
-        reconocio = True
+        ok = True
 
-    return cfg, ("si" if reconocio else "?")
+    return cfg, ("si" if ok else "?")
 
 
 def es_comando(texto, patron):
     return bool(re.fullmatch(patron, texto.lower().strip(" .!¡¿?")))
 
 
-# ---------------------------------------------------------- horarios
-
-def hora_del_slot(slot):
-    iso = slot.get("isoBogota")
-    if iso:
-        try:
-            return (datetime.fromisoformat(iso.replace("Z", "+00:00"))
-                    .astimezone(TZ).strftime("%H:%M"))
-        except ValueError:
-            pass
-    bruto = (slot.get("timeLabel") or slot.get("timeStr") or "").strip()
-    p = bruto.split(":")
-    if len(p) >= 2 and p[0].strip().isdigit():
-        return f"{int(p[0]):02d}:{p[1][:2]}"
-    return bruto
-
-
-def obtener_slots(subnivel, fecha):
-    slots = api_get("getSlotsForDate", subnivel=subnivel, dateStr=fecha)
-    if isinstance(slots, dict):
-        slots = slots.get("slots") or slots.get("result") or []
-    return slots or []
-
-
-# ---------------------------------------------------------- clase e intencion
+# ---------------------------------------------------------- clase sugerida
 
 def proxima_clase(cfg, estado, activa):
-    """
-    Prioridad: reserva en el sistema (aunque ya haya pasado) > estado.json > config.
-    """
     ultima, subnivel = None, cfg["subnivel"]
-
     if activa and str(activa.get("clase", "")).strip().isdigit():
         ultima = int(activa["clase"])
         subnivel = activa.get("subnivel") or subnivel
@@ -307,72 +358,143 @@ def proxima_clase(cfg, estado, activa):
     tope = cfg.get("max_clase")
     if tope and siguiente > int(tope):
         return subnivel, str(ultima), True
-
     return subnivel, str(siguiente), False
 
 
-def objetivo_de_la_proxima_corrida(cfg):
-    """
-    Que dia quedaria reservado si pides algo ahora mismo. La corrida de reserva
-    es a las 00:15 y programa para 'dias_adelante' dias despues de esa corrida.
-    """
-    dias = int(cfg.get("dias_adelante", 1))
-    hh, mm = (int(x) for x in str(cfg.get("hora_corrida_reserva", "00:15")).split(":"))
-    ahora = datetime.now(TZ)
-    corrida = ahora.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if ahora >= corrida:
-        corrida += timedelta(days=1)
-    return corrida + timedelta(days=dias)
+# ---------------------------------------------------------- reserva inmediata
+
+def reservar_ahora(cfg, estado, documento, subnivel, clase, hora, fecha_obj):
+    """Reserva ya mismo. Devuelve True si quedo."""
+    motivo = sin_clases(fecha_obj, cfg)
+    if motivo:
+        alterno = proximo_dia_habil(fecha_obj + timedelta(days=1), cfg)
+        enviar(f"El {fecha_bonita(fecha_obj)} no hay clases porque {motivo}.\n"
+               f"El siguiente dia habil es el {fecha_bonita(alterno)}. "
+               "Escribeme la hora si quieres que lo intente ahi.")
+        return False
+
+    activa = reserva_activa(documento)
+    if bloqueante(activa):
+        cuando = fecha_de_reserva(activa)
+        enviar("No puedo reservar todavia: tienes una clase pendiente sin ver.\n"
+               f"{describir(activa)}\n\n"
+               + (f"Escribeme despues de las {(cuando + timedelta(hours=2)):%H:%M} "
+                  "y la programo de una." if cuando else
+                  "Escribeme cuando ya la hayas visto."))
+        return False
+
+    email = os.environ.get("SMARTFLEX_EMAIL", "").strip()
+    if not email:
+        enviar("No reserve: falta el secret SMARTFLEX_EMAIL.")
+        return False
+
+    sesion = api_get("login", documento=documento)
+    if not sesion.get("ok"):
+        enviar(f"El sistema rechazo el ingreso: {sesion.get('error','sin detalle')}")
+        return False
+    nombre = sesion.get("nombreCompleto", "")
+
+    fecha = fecha_obj.strftime("%Y-%m-%d")
+    alternativa = bool(cfg.get("reservar_alternativa", False))
+    ultimo_error = None
+
+    for intento in range(1, INTENTOS + 1):
+        try:
+            disponibles = {hora_del_slot(s): s for s in obtener_slots(subnivel, fecha)}
+            log(f"Intento {intento} para {fecha}: {sorted(disponibles) or 'sin horas'}")
+
+            elegido, hora_final = disponibles.get(hora), hora
+            if not elegido and alternativa and disponibles:
+                hora_final = sorted(disponibles)[0]
+                elegido = disponibles[hora_final]
+
+            if elegido:
+                res = api_post("book", subnivel=subnivel, slotId=elegido.get("slotId"),
+                               email=email, clase=clase,
+                               slotIso=elegido.get("isoBogota", ""),
+                               userTz="America/Bogota", dispositivo_id=device_id(),
+                               documento=documento, name=nombre)
+                if res.get("ok"):
+                    if str(clase).isdigit():
+                        estado["ultima_clase_reservada"] = int(clase)
+                        estado["subnivel"] = subnivel
+                    guardar_estado(estado)
+                    extra = "" if hora_final == hora else f"\n(no habia a las {hora}, tome esta)"
+                    enviar(f"RESERVADO\n{subnivel} clase {clase}\n"
+                           f"{fecha_bonita(fecha_obj)} a las {hora_final}\n"
+                           f"id: {res.get('bookingId','')}{extra}")
+                    return True
+                if res.get("booking"):
+                    enviar("No reserve: el sistema reporta una reserva activa tuya.")
+                    return False
+                ultimo_error = res.get("error", "rechazado sin detalle")
+            else:
+                ultimo_error = (f"no hay cupo a las {hora}. Disponibles: "
+                                f"{', '.join(sorted(disponibles)) if disponibles else 'ninguna'}")
+        except requests.RequestException as e:
+            ultimo_error = f"error de conexion ({e})"
+
+        if intento < INTENTOS:
+            time.sleep(ESPERA)
+
+    enviar(f"NO RESERVADO\n{subnivel} clase {clase} - {fecha_bonita(fecha_obj)} a las {hora}\n"
+           f"Motivo: {ultimo_error}\n(ejecutado {datetime.now(TZ):%H:%M})")
+    return False
 
 
-def pendiente_vigente(estado):
-    """La intencion anotada, si su fecha objetivo sigue en el futuro."""
-    p = estado.get("pendiente")
-    if not p:
-        return None
-    if str(p.get("para", "")) <= datetime.now(TZ).strftime("%Y-%m-%d"):
-        log(f"Intencion vencida (era para {p.get('para')}), la descarto.")
-        return None
-    return p
+# ---------------------------------------------------------- citas programadas
 
-
-def fecha_que_abre_hoy(cfg):
-    """
-    El dia cuyos cupos se liberan en la corrida de hoy. Si la reserva se hace
-    a las 00:15 del viernes para el sabado, dias_adelante es 1.
-    """
-    dias = int(cfg.get("dias_adelante", 1))
-    return (datetime.now(TZ) + timedelta(days=dias)).strftime("%Y-%m-%d")
-
-
-# Alias conservado para el resto del codigo.
-def pendiente_valido(estado, cfg):
-    return pendiente_vigente(estado)
-
-
-def anotar(estado, cfg, subnivel, clase, hora):
-    objetivo = objetivo_de_la_proxima_corrida(cfg)
-    estado["pendiente"] = {"subnivel": subnivel, "clase": str(clase), "hora": hora,
-                           "para": objetivo.strftime("%Y-%m-%d"),
-                           "creado": int(time.time())}
+def poner_cita(estado, cuando, subnivel=None, clase=None, hora=None, fecha=None):
+    estado["cita"] = {"cuando": cuando.strftime("%Y-%m-%d %H:%M"),
+                      "subnivel": subnivel, "clase": clase,
+                      "hora": hora, "para": fecha.strftime("%Y-%m-%d") if fecha else None}
     guardar_estado(estado)
-    return objetivo
 
 
-def olvidar(estado):
-    if estado.get("pendiente"):
-        estado["pendiente"] = None
+def cita_pendiente(estado):
+    c = estado.get("cita")
+    if not c or not c.get("cuando"):
+        return None
+    try:
+        cuando = datetime.strptime(c["cuando"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        return None
+    ahora = datetime.now(TZ)
+    if cuando > ahora:
+        return None
+    if ahora - cuando > timedelta(hours=12):
+        log("Cita demasiado vieja, la descarto.")
+        estado["cita"] = None
         guardar_estado(estado)
+        return None
+    return c
+
+
+def ejecutar_cita(cfg, estado, documento, c):
+    log(f"Ejecutando cita de las {c['cuando']}")
+    activa = reserva_activa(documento)
+    s, cl, _ = proxima_clase(cfg, estado, activa)
+    subnivel = c.get("subnivel") or s
+    clase = c.get("clase") or cl
+    hora = c.get("hora") or cfg["hora"]
+    fecha = (datetime.strptime(c["para"], "%Y-%m-%d").date() if c.get("para")
+             else datetime.now(TZ).date() + timedelta(days=1))
+
+    estado["cita"] = None
+    guardar_estado(estado)
+    reservar_ahora(cfg, estado, documento, subnivel, clase, hora, fecha)
 
 
 # ---------------------------------------------------------- mensajes
 
-def preguntar_hora(cfg, estado, documento, encabezado):
-    """Manda el menu principal: propone clase y ofrece las horas como botones."""
+def menu(cfg, estado, documento, encabezado):
     activa = reserva_activa(documento)
     if bloqueante(activa):
-        enviar(f"{encabezado}\n\nYa tienes una reserva activa:\n{describir(activa)}\n\n"
-               "El sistema solo permite una a la vez. Escribeme 'cancelar' para liberarla.",
+        cuando = fecha_de_reserva(activa)
+        enviar(f"{encabezado}\n\nTienes una clase pendiente sin ver:\n{describir(activa)}\n\n"
+               "El sistema no deja programar otra hasta que la veas."
+               + (f"\nEscribeme despues de las {(cuando + timedelta(hours=2)):%H:%M}."
+                  if cuando else ""),
                botones=[[TEXTO_CANCELAR, TEXTO_ESTADO]])
         return
 
@@ -382,23 +504,20 @@ def preguntar_hora(cfg, estado, documento, encabezado):
                "Dime cual sigue, por ejemplo 'A2.1 clase 1 19:00'.")
         return
 
-    objetivo = objetivo_de_la_proxima_corrida(cfg)
+    manana = datetime.now(TZ).date() + timedelta(days=1)
+    objetivo = proximo_dia_habil(manana, cfg)
+    nota = ""
+    if objetivo != manana:
+        nota = f"\n(manana no hay clases porque {sin_clases(manana, cfg)})"
+
     sugeridas = cfg.get("horas_sugeridas") or [cfg["hora"]]
     botones = [sugeridas[i:i + 3] for i in range(0, len(sugeridas), 3)]
     botones.append([TEXTO_NO, TEXTO_ESTADO])
 
-    enviar(f"{encabezado}\n\n"
-           f"Te propongo {subnivel} clase {clase} para el {fecha_bonita(objetivo)}.\n"
-           "Toca una hora, o escribeme algo como 'clase 12 8pm'.",
+    enviar(f"{encabezado}\n\nTe propongo {subnivel} clase {clase} "
+           f"para el {fecha_bonita(objetivo)}.{nota}\n"
+           "Toca una hora y la reservo de una, o escribeme 'lunes 7pm'.",
            botones=botones)
-
-
-def confirmar_anotado(estado, cfg, subnivel, clase, hora):
-    objetivo = anotar(estado, cfg, subnivel, clase, hora)
-    enviar(f"Anotado: {subnivel} clase {clase} a las {hora}\n"
-           f"para el {fecha_bonita(objetivo)}.\n\n"
-           "Lo reservo en la madrugada y te confirmo. "
-           "Si cambias de idea, escribeme 'no reservar'.")
 
 
 def cancelar(documento, estado):
@@ -406,15 +525,12 @@ def cancelar(documento, estado):
     if not activa:
         enviar("No tienes ninguna reserva activa para cancelar.")
         return
-
     if ya_paso(activa):
         enviar(f"No cancele nada: esa clase ya se dicto.\n{describir(activa)}\n"
-               "El sistema la sigue mostrando, pero no te bloquea para reservar otra.")
+               "El sistema la sigue mostrando, pero no te bloquea.")
         return
-
     res = api_post("cancel", bookingId=activa.get("bookingId"),
                    token=activa.get("cancelToken", ""), source="telegram_bot")
-
     if res.get("ok"):
         clase = str(activa.get("clase", "")).strip()
         if clase.isdigit() and estado.get("ultima_clase_reservada") == int(clase):
@@ -436,189 +552,121 @@ def contar_estado(cfg, estado, documento):
     else:
         partes.append("No tienes ninguna reserva en el sistema.")
 
-    p = pendiente_valido(estado, cfg)
-    if p:
-        partes.append(f"Anotado para esta madrugada:\n"
-                      f"{p['subnivel']} clase {p['clase']} a las {p['hora']}")
+    c = estado.get("cita")
+    if c and c.get("cuando"):
+        detalle = f"{c.get('subnivel') or ''} clase {c.get('clase') or '?'} a las {c.get('hora') or '?'}"
+        partes.append(f"Cita puesta para el {c['cuando']}:\n{detalle.strip()}")
     else:
-        partes.append("No tienes nada anotado para esta madrugada.")
-
+        partes.append("No tienes ninguna cita puesta.")
     enviar("\n\n".join(partes))
 
 
 # ---------------------------------------------------------- modos
 
-def modo_escuchar(cfg, estado, documento):
-    ultimo_visto = int(estado.get("ultimo_update_procesado", 0))
-    limite = time.time() - float(cfg.get("ventana_comandos_horas", 2)) * 3600
-
-    pendientes = [m for m in mensajes_mios(obtener_updates())
-                  if m["id"] > ultimo_visto and m["fecha"] >= limite]
-    if not pendientes:
-        log("Sin mensajes nuevos.")
-        return
-
-    estado["ultimo_update_procesado"] = max(m["id"] for m in pendientes)
-    guardar_estado(estado)
-
-    texto = pendientes[-1]["texto"]   # solo el ultimo cuenta
-
+def atender(cfg, estado, documento, texto):
     if es_comando(texto, r"(cancelar|cancela|cancelar clase|cancelar reserva)"):
         cancelar(documento, estado)
-        olvidar(estado)
         return
-
     if es_comando(texto, r"(estado|ver estado|que tengo|qué tengo|mi reserva|reserva)"):
         contar_estado(cfg, estado, documento)
         return
 
+    t = texto.lower()
     activa = reserva_activa(documento)
-    subnivel_sug, clase_sug, _ = proxima_clase(cfg, estado, activa)
-    base = dict(cfg, subnivel=subnivel_sug, clase=clase_sug)
-    params, veredicto = interpretar(texto, base)
+    s_sug, c_sug, _ = proxima_clase(cfg, estado, activa)
+
+    # "entra el domingo 00:15 ..." -> deja una cita
+    if re.search(r"\bentra\b|\bentrar\b", t):
+        dia = interpretar_dia(t) or (datetime.now(TZ).date() + timedelta(days=1))
+        horas = re.findall(r"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(?:am|pm)\b", t)
+        h_entrada = interpretar_hora(horas[0]) if horas else "00:15"
+        h_clase = interpretar_hora(horas[1]) if len(horas) > 1 else None
+        cuando = datetime.strptime(f"{dia} {h_entrada}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+
+        m = re.search(r"clase\s*(\d+)", t)
+        clase = m.group(1) if m else c_sug
+        destino = dia + timedelta(days=1)
+
+        poner_cita(estado, cuando, s_sug, clase, h_clase, destino)
+        falta = "" if h_clase else "\nDime a que hora quieres la clase y la anoto."
+        enviar(f"Cita puesta: entro el {fecha_bonita(dia)} a las {h_entrada}\n"
+               f"y busco {s_sug} clase {clase} para el {fecha_bonita(destino)}"
+               + (f" a las {h_clase}." if h_clase else ".") + falta)
+        return
+
+    params, veredicto = interpretar(texto, dict(cfg, subnivel=s_sug, clase=c_sug))
 
     if veredicto == "no":
-        olvidar(estado)
-        enviar("Listo, no reservo nada. Si cambias de idea, escribeme una hora.")
-    elif veredicto == "si":
-        if bloqueante(activa):
-            enviar(f"No puedo anotarlo: ya tienes una reserva activa.\n{describir(activa)}\n"
-                   "Escribeme 'cancelar' para liberarla.")
-        else:
-            confirmar_anotado(estado, cfg, params["subnivel"], params["clase"], params["hora"])
-    else:
-        preguntar_hora(cfg, estado, documento, "Hola. Que quieres hacer?")
-
-
-def modo_preguntar(cfg, estado, documento):
-    """A las 8 p.m. Solo molesta si no le has pedido nada."""
-    p = pendiente_valido(estado, cfg)
-    if p:
-        cuando = datetime.strptime(p["para"], "%Y-%m-%d").replace(tzinfo=TZ)
-        enviar(f"Recordatorio: ya tienes anotado {p['subnivel']} clase {p['clase']} "
-               f"a las {p['hora']} para el {fecha_bonita(cuando)}.\n"
-               "Lo reservo en la madrugada. Escribeme 'no reservar' si cambiaste de idea.")
-        return
-
-    preguntar_hora(cfg, estado, documento,
-                   "No me has pedido clase para manana.")
-
-
-def modo_reservar(cfg, estado, documento):
-    objetivo_hoy = fecha_que_abre_hoy(cfg)
-    ahora = datetime.now(TZ)
-    programada = str(cfg.get("hora_corrida_reserva", "00:15"))
-    log(f"Corrida real: {ahora:%H:%M} (programada {programada}). "
-        f"Hoy se liberan los cupos del {objetivo_hoy}.")
-
-    p = pendiente_vigente(estado)
-
-    # Una intencion para otro dia NO se toca: le corresponde a otra corrida.
-    if p and p["para"] != objetivo_hoy:
-        log(f"La intencion es para el {p['para']}, no para el {objetivo_hoy}. La dejo intacta.")
-        enviar(f"Hoy se liberan los cupos del {objetivo_hoy}, pero tu reserva "
-               f"anotada es para el {p['para']}. No toque nada: la hago esa madrugada.")
-        return
-
-    # Respaldo: si el listener no corrio, leo el chat directamente.
-    # Solo mensajes que ninguna corrida haya procesado antes.
-    if not p:
-        ultimo_visto = int(estado.get("ultimo_update_procesado", 0))
-        limite = time.time() - float(cfg.get("ventana_respuesta_horas", 24)) * 3600
-        nuevos = [m for m in mensajes_mios(obtener_updates())
-                  if m["id"] > ultimo_visto and m["fecha"] >= limite]
-        if nuevos:
-            estado["ultimo_update_procesado"] = max(m["id"] for m in nuevos)
-            activa = reserva_activa(documento)
-            s, c, _ = proxima_clase(cfg, estado, activa)
-            params, veredicto = interpretar(nuevos[-1]["texto"], dict(cfg, subnivel=s, clase=c))
-            if veredicto == "si":
-                log("Sin intencion anotada, pero encontre tu mensaje en el chat.")
-                p = {"subnivel": params["subnivel"], "clase": str(params["clase"]),
-                     "hora": params["hora"], "para": objetivo_hoy}
+        if estado.get("cita"):
+            estado["cita"] = None
             guardar_estado(estado)
-
-    if not p:
-        if cfg.get("avisar_si_no_hubo_respuesta", True):
-            enviar("No me pediste clase, asi que no reserve nada.")
+        enviar("Listo, no reservo nada.")
         return
 
-    subnivel, clase, hora = p["subnivel"], str(p["clase"]), p["hora"]
-    alternativa = bool(cfg.get("reservar_alternativa", False))
-    fecha = p["para"]
-    objetivo = datetime.strptime(fecha, "%Y-%m-%d").replace(tzinfo=TZ)
+    if veredicto == "?":
+        menu(cfg, estado, documento, "Hola. Que quieres hacer?")
+        return
 
-    email = os.environ.get("SMARTFLEX_EMAIL", "").strip()
-    if not email:
-        enviar("No reserve: falta el secret SMARTFLEX_EMAIL con tu correo.")
-        sys.exit(1)
+    # Si hay una cita a medias esperando la hora, la completa.
+    c = estado.get("cita")
+    if c and c.get("cuando") and not c.get("hora") and params.get("hora"):
+        c["hora"] = params["hora"]
+        guardar_estado(estado)
+        enviar(f"Anotado. En la cita del {c['cuando']} busco a las {params['hora']}.")
+        return
 
-    log(f"Objetivo: {subnivel} clase {clase}, {fecha} a las {hora}")
+    if params.get("fecha"):
+        objetivo = datetime.strptime(params["fecha"], "%Y-%m-%d").date()
+    else:
+        objetivo = proximo_dia_habil(datetime.now(TZ).date() + timedelta(days=1), cfg)
 
-    sesion = api_get("login", documento=documento)
-    if not sesion.get("ok"):
-        enviar(f"El sistema rechazo el ingreso: {sesion.get('error','sin detalle')}")
-        sys.exit(1)
-    nombre = sesion.get("nombreCompleto", "")
+    reservar_ahora(cfg, estado, documento, params["subnivel"], str(params["clase"]),
+                   params["hora"], objetivo)
+
+
+def modo_escuchar(cfg, estado, documento):
+    c = cita_pendiente(estado)
+    if c:
+        ejecutar_cita(cfg, estado, documento, c)
+
+    ultimo_visto = int(estado.get("ultimo_update_procesado", 0))
+    limite = time.time() - float(cfg.get("ventana_comandos_horas", 2)) * 3600
+    nuevos = [m for m in mensajes_mios(obtener_updates())
+              if m["id"] > ultimo_visto and m["fecha"] >= limite]
+    if not nuevos:
+        log("Sin mensajes nuevos.")
+        return
+
+    estado["ultimo_update_procesado"] = max(m["id"] for m in nuevos)
+    guardar_estado(estado)
+    atender(cfg, estado, documento, nuevos[-1]["texto"])
+
+
+def modo_recordar(cfg, estado, documento):
+    """9:20 p.m. Justo despues de la clase, cuando el cupo queda libre."""
+    manana = datetime.now(TZ).date() + timedelta(days=1)
+    motivo = sin_clases(manana, cfg)
+    if motivo:
+        habil = proximo_dia_habil(manana, cfg)
+        enviar(f"Manana no hay clases porque {motivo}.\n"
+               f"El siguiente dia habil es el {fecha_bonita(habil)}. "
+               "Si quieres, escribeme 'entra el "
+               f"{DIAS[(habil - timedelta(days=1)).weekday()]} 00:15' y la busco apenas abran.")
+        return
 
     activa = reserva_activa(documento)
-    if bloqueante(activa):
-        enviar(f"No reserve: ya tienes una reserva activa\n{describir(activa)}")
-        olvidar(estado)
-        return
+    if activa and not ya_paso(activa):
+        cuando = fecha_de_reserva(activa)
+        if cuando and cuando.date() == manana:
+            log("Ya tiene reservada la de manana, no molesto.")
+            return
 
-    ultimo_error = None
-    for intento in range(1, INTENTOS + 1):
-        try:
-            disponibles = {hora_del_slot(s): s for s in obtener_slots(subnivel, fecha)}
-            log(f"Intento {intento}: {sorted(disponibles) or 'sin horas'}")
-
-            elegido, hora_final = disponibles.get(hora), hora
-            if not elegido and alternativa and disponibles:
-                hora_final = sorted(disponibles)[0]
-                elegido = disponibles[hora_final]
-
-            if elegido:
-                res = api_post("book",
-                               subnivel=subnivel, slotId=elegido.get("slotId"), email=email,
-                               clase=clase, slotIso=elegido.get("isoBogota", ""),
-                               userTz="America/Bogota", dispositivo_id=device_id(),
-                               documento=documento, name=nombre)
-                if res.get("ok"):
-                    if clase.isdigit():
-                        estado["ultima_clase_reservada"] = int(clase)
-                        estado["subnivel"] = subnivel
-                    estado["pendiente"] = None
-                    guardar_estado(estado)
-                    extra = "" if hora_final == hora else f"\n(no habia a las {hora}, tome esta)"
-                    enviar(f"RESERVADO\n{subnivel} clase {clase}\n"
-                           f"{fecha_bonita(objetivo)} a las {hora_final}\n"
-                           f"id: {res.get('bookingId','')}{extra}\n"
-                           f"(ejecutado {datetime.now(TZ):%H:%M})")
-                    return
-                if res.get("booking"):
-                    enviar("No reserve: el sistema reporta una reserva activa tuya.")
-                    olvidar(estado)
-                    return
-                ultimo_error = res.get("error", "rechazado sin detalle")
-            else:
-                ultimo_error = (f"no hay cupo a las {hora}. Disponibles: "
-                                f"{', '.join(sorted(disponibles)) if disponibles else 'ninguna'}")
-        except requests.RequestException as e:
-            ultimo_error = f"error de conexion ({e})"
-
-        if intento < INTENTOS:
-            time.sleep(ESPERA)
-
-    olvidar(estado)
-    enviar(f"NO RESERVADO\n{subnivel} clase {clase} - {fecha_bonita(objetivo)} a las {hora}\n"
-           f"Motivo: {ultimo_error}\n"
-           f"(ejecutado {datetime.now(TZ):%H:%M})")
+    menu(cfg, estado, documento, "Ya termino tu clase. Quieres programar la de manana?")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--modo", choices=["preguntar", "reservar", "escuchar"], required=True)
+    ap.add_argument("--modo", choices=["escuchar", "recordar"], required=True)
     args = ap.parse_args()
 
     documento = os.environ.get("SMARTFLEX_DOC")
@@ -627,14 +675,16 @@ def main():
         sys.exit(1)
 
     cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    estado = cargar(ESTADO_FILE, {"ultima_clase_reservada": None,
-                                  "subnivel": cfg["subnivel"],
-                                  "ultimo_update_procesado": 0,
-                                  "pendiente": None})
+    base = {"ultima_clase_reservada": None, "subnivel": cfg["subnivel"],
+            "ultimo_update_procesado": 0, "cita": None}
+    estado = base
+    if ESTADO_FILE.exists():
+        try:
+            estado = {**base, **json.loads(ESTADO_FILE.read_text(encoding="utf-8"))}
+        except ValueError:
+            log("estado.json ilegible, uso valores por defecto.")
 
-    {"preguntar": modo_preguntar,
-     "reservar": modo_reservar,
-     "escuchar": modo_escuchar}[args.modo](cfg, estado, documento)
+    (modo_escuchar if args.modo == "escuchar" else modo_recordar)(cfg, estado, documento)
 
 
 if __name__ == "__main__":

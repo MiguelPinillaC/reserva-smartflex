@@ -1,6 +1,8 @@
+cat > estado.json <<'FIN'
 {
   "ultima_clase_reservada": 10,
   "subnivel": "A1.2",
   "ultimo_update_procesado": 309237229,
-  "pendiente": null
+  "cita": null
 }
+FIN
