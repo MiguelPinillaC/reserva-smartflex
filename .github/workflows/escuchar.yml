@@ -1,8 +1,7 @@
 name: 1. Escuchar y reservar
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
+  # Sin 'schedule': solo corre cuando lo llama el reloj externo
   workflow_dispatch:
 
 permissions:
