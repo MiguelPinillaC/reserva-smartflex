@@ -1,9 +1,8 @@
-name: 3. Escuchar comandos (cancelar / estado)
+name: 1. Escuchar y reservar
 
 on:
   schedule:
-    # Cada 10 minutos. Ver INSTRUCCIONES.md sobre minutos de Actions.
-    - cron: "*/10 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -24,6 +23,8 @@ jobs:
       - run: pip install requests
       - env:
           SMARTFLEX_DOC: ${{ secrets.SMARTFLEX_DOC }}
+          SMARTFLEX_EMAIL: ${{ secrets.SMARTFLEX_EMAIL }}
+          SMARTFLEX_DEVICE_ID: ${{ secrets.SMARTFLEX_DEVICE_ID }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python reservar_smartflex.py --modo escuchar
