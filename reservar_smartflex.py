@@ -310,30 +310,38 @@ def interpretar_dia(t, ahora=None):
 
 
 def interpretar(texto, base):
-    """Devuelve (parametros, veredicto) con veredicto 'si' / 'no' / '?'."""
+    """
+    Devuelve (parametros, veredicto):
+      'si'   trae datos concretos -> reservar de una
+      'menu' dijo que si, pero sin decir que -> hay que preguntarle
+      'no'   dijo que no
+      '?'    no se entiende
+    """
     cfg = dict(base)
     t = texto.lower().strip()
 
     if re.search(r"(no reservar|no gracias|saltar|omitir|^no\b|^nel\b)", t):
         return cfg, "no"
 
-    ok = False
+    concreto = False
     m = re.search(r"\b([a-c][12]\.\d)\b", t)
     if m:
-        cfg["subnivel"] = m.group(1).upper(); ok = True
+        cfg["subnivel"] = m.group(1).upper(); concreto = True
     m = re.search(r"clase\s*(\d+)", t)
     if m:
-        cfg["clase"] = m.group(1); ok = True
+        cfg["clase"] = m.group(1); concreto = True
     h = interpretar_hora(t)
     if h:
-        cfg["hora"] = h; ok = True
+        cfg["hora"] = h; concreto = True
     d = interpretar_dia(t)
     if d:
-        cfg["fecha"] = d.strftime("%Y-%m-%d"); ok = True
-    if re.search(r"\b(si|sí|dale|listo|ok|claro|reserva|reservar|programa|programar)\b", t):
-        ok = True
+        cfg["fecha"] = d.strftime("%Y-%m-%d"); concreto = True
 
-    return cfg, ("si" if ok else "?")
+    if concreto:
+        return cfg, "si"
+    if re.search(r"\b(si|sí|dale|listo|ok|claro|reserva|reservar|programa|programar)\b", t):
+        return cfg, "menu"
+    return cfg, "?"
 
 
 def es_comando(texto, patron):
@@ -510,14 +518,39 @@ def menu(cfg, estado, documento, encabezado):
     if objetivo != manana:
         nota = f"\n(manana no hay clases porque {sin_clases(manana, cfg)})"
 
-    sugeridas = cfg.get("horas_sugeridas") or [cfg["hora"]]
-    botones = [sugeridas[i:i + 3] for i in range(0, len(sugeridas), 3)]
-    botones.append([TEXTO_NO, TEXTO_ESTADO])
+    cabeza = (f"{encabezado}\n\n{subnivel} clase {clase}\n"
+              f"Reservaria para el {fecha_bonita(objetivo)}.{nota}")
 
-    enviar(f"{encabezado}\n\nTe propongo {subnivel} clase {clase} "
-           f"para el {fecha_bonita(objetivo)}.{nota}\n"
-           "Toca una hora y la reservo de una, o escribeme 'lunes 7pm'.",
-           botones=botones)
+    # Horas reales del sistema, no una lista fija.
+    try:
+        reales = sorted({hora_del_slot(s)
+                         for s in obtener_slots(subnivel, objetivo.strftime("%Y-%m-%d"))})
+    except (requests.RequestException, ValueError) as e:
+        log(f"No pude consultar horarios: {e}")
+        reales = None
+
+    if reales is None:
+        sugeridas = cfg.get("horas_sugeridas") or [cfg["hora"]]
+        botones = [sugeridas[i:i + 3] for i in range(0, len(sugeridas), 3)]
+        botones.append([TEXTO_NO, TEXTO_ESTADO])
+        enviar(f"{cabeza}\n\nNo pude consultar los horarios ahora. "
+               "Dime una hora e igual lo intento.", botones=botones)
+        return
+
+    if not reales:
+        vispera = objetivo - timedelta(days=1)
+        enviar(f"{cabeza}\n\nTodavia no hay ningun horario publicado para ese dia. "
+               "Los cupos abren la madrugada anterior.\n\n"
+               f"Escribeme 'entra el {DIAS[vispera.weekday()]} 00:15' "
+               "y lo busco apenas los abran.",
+               botones=[[f"entra el {DIAS[vispera.weekday()]} 00:15"], [TEXTO_ESTADO]])
+        return
+
+    visibles = reales[:9]
+    botones = [visibles[i:i + 3] for i in range(0, len(visibles), 3)]
+    botones.append([TEXTO_NO, TEXTO_ESTADO])
+    enviar(f"{cabeza}\n\nHoras libres: {', '.join(reales)}\n"
+           "Toca una y la reservo de una.", botones=botones)
 
 
 def cancelar(documento, estado):
@@ -601,6 +634,10 @@ def atender(cfg, estado, documento, texto):
             estado["cita"] = None
             guardar_estado(estado)
         enviar("Listo, no reservo nada.")
+        return
+
+    if veredicto == "menu":
+        menu(cfg, estado, documento, "Que clase quieres reservar?")
         return
 
     if veredicto == "?":
