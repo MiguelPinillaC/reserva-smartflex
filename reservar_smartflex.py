@@ -553,6 +553,30 @@ def menu(cfg, estado, documento, encabezado):
            "Toca una y la reservo de una.", botones=botones)
 
 
+def describir_cita(c):
+    """
+    Frase unica para la cita. La usan tanto la confirmacion como el estado,
+    para que el mismo dato nunca se cuente de dos formas distintas.
+    """
+    try:
+        cuando = datetime.strptime(c["cuando"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        entrada = f"{fecha_bonita(cuando)} a las {cuando:%H:%M}"
+    except (ValueError, KeyError, TypeError):
+        entrada = str(c.get("cuando", "?"))
+
+    que = f"{c.get('subnivel') or ''} clase {c.get('clase') or '?'}".strip()
+
+    if c.get("para"):
+        try:
+            destino = datetime.strptime(c["para"], "%Y-%m-%d").date()
+            que += f" para el {fecha_bonita(destino)}"
+        except ValueError:
+            pass
+
+    que += f" a las {c['hora']}" if c.get("hora") else " (falta la hora)"
+    return f"Entro el {entrada}\ny busco {que}."
+
+
 def cancelar(documento, estado):
     activa = reserva_activa(documento)
     if not activa:
@@ -587,8 +611,7 @@ def contar_estado(cfg, estado, documento):
 
     c = estado.get("cita")
     if c and c.get("cuando"):
-        detalle = f"{c.get('subnivel') or ''} clase {c.get('clase') or '?'} a las {c.get('hora') or '?'}"
-        partes.append(f"Cita puesta para el {c['cuando']}:\n{detalle.strip()}")
+        partes.append("Cita puesta:\n" + describir_cita(c))
     else:
         partes.append("No tienes ninguna cita puesta.")
     enviar("\n\n".join(partes))
@@ -621,10 +644,8 @@ def atender(cfg, estado, documento, texto):
         destino = dia + timedelta(days=1)
 
         poner_cita(estado, cuando, s_sug, clase, h_clase, destino)
-        falta = "" if h_clase else "\nDime a que hora quieres la clase y la anoto."
-        enviar(f"Cita puesta: entro el {fecha_bonita(dia)} a las {h_entrada}\n"
-               f"y busco {s_sug} clase {clase} para el {fecha_bonita(destino)}"
-               + (f" a las {h_clase}." if h_clase else ".") + falta)
+        falta = "" if h_clase else "\n\nDime a que hora quieres la clase y la anoto."
+        enviar("Cita puesta.\n" + describir_cita(estado["cita"]) + falta)
         return
 
     params, veredicto = interpretar(texto, dict(cfg, subnivel=s_sug, clase=c_sug))
@@ -649,7 +670,7 @@ def atender(cfg, estado, documento, texto):
     if c and c.get("cuando") and not c.get("hora") and params.get("hora"):
         c["hora"] = params["hora"]
         guardar_estado(estado)
-        enviar(f"Anotado. En la cita del {c['cuando']} busco a las {params['hora']}.")
+        enviar("Anotado.\n" + describir_cita(c))
         return
 
     if params.get("fecha"):
