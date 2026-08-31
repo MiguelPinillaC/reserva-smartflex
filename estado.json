@@ -1,12 +1,6 @@
 {
   "ultima_clase_reservada": null,
   "subnivel": "A1.1",
-  "ultimo_update_procesado": 309237238,
-  "cita": {
-    "cuando": "2026-08-31 00:15",
-    "subnivel": "A1.2",
-    "clase": "11",
-    "hora": "19:00",
-    "para": "2026-09-01"
-  }
+  "ultimo_update_procesado": 309237239,
+  "cita": null
 }
