@@ -11,5 +11,6 @@
   "ventana_comandos_horas": 2,
   "reservar_alternativa": false,
   "sin_clases_domingo": true,
-  "sin_clases_festivos": true
+  "sin_clases_festivos": true,
+  "hora_apertura_cupos": "00:15"
 }

@@ -230,11 +230,57 @@ def hora_del_slot(slot):
     return f"{int(p[0]):02d}:{p[1][:2]}" if len(p) >= 2 and p[0].strip().isdigit() else bruto
 
 
+def _slots_de(resp):
+    """Extrae los slots. Devuelve None si la API reporto un error."""
+    if isinstance(resp, dict):
+        if resp.get("ok") is False:
+            log(f"La API respondio error: {resp.get('error', 'sin detalle')}")
+            return None
+        return resp.get("slots") or resp.get("result") or []
+    return resp or []
+
+
+def todos_los_slots(subnivel):
+    """
+    Via principal, la misma del sitio: getAvailableSlots trae todo de una
+    y el filtro por fecha se hace aca. Devuelve None si fallo.
+    """
+    try:
+        s = _slots_de(api_get("getAvailableSlots", subnivel=subnivel))
+        if s is not None:
+            log(f"getAvailableSlots({subnivel}): {len(s)} horarios en total")
+        return s
+    except (requests.RequestException, ValueError) as e:
+        log(f"getAvailableSlots fallo: {e}")
+        return None
+
+
+def fechas_con_cupo(subnivel):
+    """dateStr -> lista de slots. Sirve para decir que dias si tienen."""
+    todos = todos_los_slots(subnivel)
+    mapa = {}
+    for s in todos or []:
+        d = str(s.get("dateStr", "")).strip()
+        if d:
+            mapa.setdefault(d, []).append(s)
+    return mapa
+
+
 def obtener_slots(subnivel, fecha):
-    slots = api_get("getSlotsForDate", subnivel=subnivel, dateStr=fecha)
-    if isinstance(slots, dict):
-        slots = slots.get("slots") or slots.get("result") or []
-    return slots or []
+    todos = todos_los_slots(subnivel)
+    if todos:
+        propios = [s for s in todos if str(s.get("dateStr", "")).strip() == fecha]
+        log(f"  de esos, {len(propios)} son del {fecha}")
+        return propios
+
+    # Respaldo: el endpoint por fecha.
+    try:
+        s = _slots_de(api_get("getSlotsForDate", subnivel=subnivel, dateStr=fecha))
+        log(f"getSlotsForDate({subnivel}, {fecha}): {len(s) if s else 0} horarios")
+        return s or []
+    except (requests.RequestException, ValueError) as e:
+        log(f"getSlotsForDate fallo: {e}")
+        return []
 
 
 # ---------------------------------------------------------- Telegram entrante
@@ -538,12 +584,33 @@ def menu(cfg, estado, documento, encabezado):
         return
 
     if not reales:
-        vispera = objetivo - timedelta(days=1)
-        enviar(f"{cabeza}\n\nTodavia no hay ningun horario publicado para ese dia. "
-               "Los cupos abren la madrugada anterior.\n\n"
-               f"Escribeme 'entra el {DIAS[vispera.weekday()]} 00:15' "
-               "y lo busco apenas los abran.",
-               botones=[[f"entra el {DIAS[vispera.weekday()]} 00:15"], [TEXTO_ESTADO]])
+        mapa = fechas_con_cupo(subnivel)
+        otras = sorted(d for d in mapa if d > datetime.now(TZ).strftime("%Y-%m-%d"))
+
+        if otras:
+            lineas = []
+            for d in otras[:5]:
+                horas = sorted({hora_del_slot(s) for s in mapa[d]})
+                fecha_d = datetime.strptime(d, "%Y-%m-%d").date()
+                lineas.append(f"  {fecha_bonita(fecha_d)}: {', '.join(horas[:6])}")
+            enviar(f"{cabeza}\n\nNo hay cupo para ese dia, pero si para estos:\n"
+                   + "\n".join(lineas)
+                   + "\n\nEscribeme por ejemplo 'viernes 7pm' y lo tomo.",
+                   botones=[[TEXTO_NO, TEXTO_ESTADO]])
+            return
+
+        abren = apertura_de(objetivo, cfg)
+        if abren > datetime.now(TZ):
+            comando = f"entra {etiqueta_dia(abren.date())} {abren:%H:%M}"
+            enviar(f"{cabeza}\n\nNo hay horarios todavia: los cupos abren el "
+                   f"{fecha_bonita(abren)} a las {abren:%H:%M}.\n\n"
+                   f"Escribeme '{comando}' y lo busco apenas los abran.",
+                   botones=[[comando], [TEXTO_ESTADO]])
+        else:
+            enviar(f"{cabeza}\n\nEl sistema no esta devolviendo ningun horario, "
+                   "ni para ese dia ni para ningun otro. Puede ser una falla "
+                   "temporal: intenta desde la pagina del curso a ver si tu si los ves.",
+                   botones=[[TEXTO_ESTADO]])
         return
 
     visibles = reales[:9]
@@ -551,6 +618,30 @@ def menu(cfg, estado, documento, encabezado):
     botones.append([TEXTO_NO, TEXTO_ESTADO])
     enviar(f"{cabeza}\n\nHoras libres: {', '.join(reales)}\n"
            "Toca una y la reservo de una.", botones=botones)
+
+
+PATRON_ESTADO = r"(estado|ver estado|que tengo|qué tengo|mi reserva|mis reservas)"
+PATRON_CANCELAR = r"(cancelar|cancela|cancelar clase|cancelar reserva)"
+
+
+def etiqueta_dia(d):
+    """'hoy', 'manana' o el nombre del dia. Lo entiende interpretar_dia."""
+    hoy = datetime.now(TZ).date()
+    if d == hoy:
+        return "hoy"
+    if d == hoy + timedelta(days=1):
+        return "manana"
+    return DIAS[d.weekday()]
+
+
+def apertura_de(fecha, cfg):
+    """Cuando abren los cupos de esa fecha: la madrugada anterior."""
+    vispera = fecha - timedelta(days=1)
+    hhmm = str(cfg.get("hora_apertura_cupos", "00:15"))
+    try:
+        return datetime.strptime(f"{vispera} {hhmm}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        return datetime.strptime(f"{vispera} 00:15", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
 
 
 def describir_cita(c):
@@ -620,10 +711,10 @@ def contar_estado(cfg, estado, documento):
 # ---------------------------------------------------------- modos
 
 def atender(cfg, estado, documento, texto):
-    if es_comando(texto, r"(cancelar|cancela|cancelar clase|cancelar reserva)"):
+    if es_comando(texto, PATRON_CANCELAR):
         cancelar(documento, estado)
         return
-    if es_comando(texto, r"(estado|ver estado|que tengo|qué tengo|mi reserva|reserva)"):
+    if es_comando(texto, PATRON_ESTADO):
         contar_estado(cfg, estado, documento)
         return
 
@@ -706,10 +797,13 @@ def modo_recordar(cfg, estado, documento):
     motivo = sin_clases(manana, cfg)
     if motivo:
         habil = proximo_dia_habil(manana, cfg)
+        abren = apertura_de(habil, cfg)
+        comando = f"entra {etiqueta_dia(abren.date())} {abren:%H:%M}"
         enviar(f"Manana no hay clases porque {motivo}.\n"
-               f"El siguiente dia habil es el {fecha_bonita(habil)}. "
-               "Si quieres, escribeme 'entra el "
-               f"{DIAS[(habil - timedelta(days=1)).weekday()]} 00:15' y la busco apenas abran.")
+               f"El siguiente dia habil es el {fecha_bonita(habil)}, "
+               f"y sus cupos abren el {fecha_bonita(abren)} a las {abren:%H:%M}.\n\n"
+               f"Escribeme '{comando}' y la busco apenas salgan.",
+               botones=[[comando], [TEXTO_ESTADO]])
         return
 
     activa = reserva_activa(documento)
@@ -722,9 +816,48 @@ def modo_recordar(cfg, estado, documento):
     menu(cfg, estado, documento, "Ya termino tu clase. Quieres programar la de manana?")
 
 
+
+def modo_diagnostico(cfg, estado, documento):
+    """Muestra que devuelve de verdad la API. No reserva nada."""
+    subnivel = cfg["subnivel"]
+    activa = reserva_activa(documento)
+    if activa:
+        subnivel = activa.get("subnivel") or subnivel
+    lineas = [f"Diagnostico para subnivel {subnivel}"]
+
+    for accion, params in [("getAvailableSlots", {"subnivel": subnivel}),
+                           ("getSlotsForDate", {"subnivel": subnivel,
+                                                "dateStr": (datetime.now(TZ).date()
+                                                            + timedelta(days=1)).strftime("%Y-%m-%d")})]:
+        try:
+            resp = api_get(accion, **params)
+        except (requests.RequestException, ValueError) as e:
+            lineas.append(f"{accion}: fallo ({e})")
+            continue
+
+        if isinstance(resp, dict):
+            lineas.append(f"{accion}: claves {sorted(resp.keys())}")
+            if resp.get("ok") is False:
+                lineas.append(f"  error: {resp.get('error','sin detalle')}")
+            slots = resp.get("slots") or resp.get("result") or []
+        else:
+            slots = resp or []
+            lineas.append(f"{accion}: lista de {len(slots)}")
+
+        lineas.append(f"  {len(slots)} horarios")
+        if slots:
+            lineas.append(f"  campos: {sorted(slots[0].keys())}")
+            fechas = sorted({str(s.get('dateStr','?')) for s in slots})
+            lineas.append(f"  fechas: {', '.join(fechas[:8])}")
+
+    texto = "\n".join(lineas)
+    log(texto.replace("\n", " | "))
+    enviar(texto)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--modo", choices=["escuchar", "recordar"], required=True)
+    ap.add_argument("--modo", choices=["escuchar", "recordar", "diagnostico"], required=True)
     args = ap.parse_args()
 
     documento = os.environ.get("SMARTFLEX_DOC")
@@ -742,7 +875,8 @@ def main():
         except ValueError:
             log("estado.json ilegible, uso valores por defecto.")
 
-    (modo_escuchar if args.modo == "escuchar" else modo_recordar)(cfg, estado, documento)
+    {"escuchar": modo_escuchar, "recordar": modo_recordar,
+     "diagnostico": modo_diagnostico}[args.modo](cfg, estado, documento)
 
 
 if __name__ == "__main__":
