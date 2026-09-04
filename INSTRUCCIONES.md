@@ -173,6 +173,22 @@ respóndele explícito una noche (`clase 12 19:00`).
 
 ---
 
+## Elegir otra clase
+
+Dentro de Brightspace **la clase la define cuál módulo abres**, no un menú. El
+widget bloquea la selección manual a propósito: el botón "Cambiar" no aparece
+en iframe, y si algo intenta abrir el selector responde *"La selección manual de
+subnivel y clase está bloqueada dentro de Brightspace"*.
+
+El bot elige igual que tú: abriendo el módulo correspondiente. Si le escribes
+`clase 14 viernes 7pm`, abre el módulo de la 14 usando el mapa de
+`config.json`. Pero si tienes trabajo autónomo pendiente, la plataforma te
+redirige a la clase que debes, y entonces el bot **no** reserva: verifica en qué
+clase abrió realmente el widget y, si no es la que pediste, aborta y te avisa.
+Preferible eso a reservarte una clase equivocada sin enterarte.
+
+---
+
 ## Si te cambian de curso
 
 `config.json → brightspace` tiene el id del curso y el mapa de cada clase al

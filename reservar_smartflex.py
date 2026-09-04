@@ -515,8 +515,34 @@ def _abrir_widget(pagina, bs, clase):
     w.wait_for_selector("#loginDoc", timeout=ESPERA_UI)
     w.fill("#loginDoc", documento)
     w.click("#loginBtn")
-    w.wait_for_selector("#appContainer", state="visible", timeout=ESPERA_UI)
-    log(f"Widget abierto en la clase {clase}")
+
+    try:
+        w.wait_for_selector("#appContainer", state="visible", timeout=ESPERA_UI)
+    except Exception:
+        error = w.locator("#launchErrorText")
+        if error.count() and error.is_visible():
+            raise RuntimeError("el widget rechazo la apertura: "
+                               + error.inner_text()[:150])
+        raise
+
+    # Dentro de Brightspace la clase la fija el modulo, no un menu: el widget
+    # bloquea la seleccion manual. Y si tienes trabajo autonomo pendiente, la
+    # plataforma te redirige a otro modulo. Las dos cosas juntas significan que
+    # podemos acabar parados en una clase distinta a la que pedimos, y reservar
+    # la equivocada sin que nadie se entere. Se verifica antes de tocar nada.
+    abierta = ""
+    try:
+        abierta = (w.locator("#valClase").inner_text(timeout=10_000) or "").strip()
+    except Exception:
+        log("No pude leer en que clase abrio el widget; sigo con cuidado.")
+
+    if abierta and abierta != str(clase):
+        raise RuntimeError(
+            f"pedi la clase {clase} y el modulo abrio en la {abierta}. "
+            "Brightspace redirige asi cuando tienes trabajo autonomo pendiente: "
+            "completalo y vuelve a intentar.")
+
+    log(f"Widget abierto en la clase {abierta or clase}")
     return w
 
 
