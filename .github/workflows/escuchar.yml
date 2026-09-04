@@ -1,11 +1,16 @@
-name: 1. Escuchar y reservar
+name: 1. Escuchar
+
+# Cada minuto, desde el reloj externo (cron-job.org).
+# Este job NO abre navegador y NO recibe la contrasena de Brightspace:
+# solo lee Telegram y deja ordenes. Por eso puede correr 1.440 veces al dia
+# sin costo y sin exponer nada.
 
 on:
-  # Sin 'schedule': solo corre cuando lo llama el reloj externo
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write        # para poder disparar "2. Reservar"
 
 concurrency:
   group: escuchar
@@ -14,13 +19,15 @@ concurrency:
 jobs:
   escuchar:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install requests
-      - env:
+
+      - id: correr
+        env:
           SMARTFLEX_DOC: ${{ secrets.SMARTFLEX_DOC }}
           SMARTFLEX_EMAIL: ${{ secrets.SMARTFLEX_EMAIL }}
           SMARTFLEX_DEVICE_ID: ${{ secrets.SMARTFLEX_DEVICE_ID }}
@@ -28,6 +35,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python reservar_smartflex.py --modo escuchar
 
+      # El estado se guarda ANTES de disparar la reserva: el otro workflow
+      # hace checkout y necesita ver la orden ya escrita.
       - name: Guardar estado
         if: always()
         run: |
@@ -39,3 +48,9 @@ jobs:
             git pull --rebase --autostash
             git push
           fi
+
+      - name: Disparar la reserva
+        if: steps.correr.outputs.reservar == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run reservar.yml --ref main

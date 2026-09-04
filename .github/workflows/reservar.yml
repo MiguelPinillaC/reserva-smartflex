@@ -1,34 +1,45 @@
-name: 1. Escuchar y reservar
+name: 2. Reservar
+
+# Solo corre cuando "1. Escuchar" encontro una orden pendiente, o si lo lanzas
+# a mano. Es el unico job que ve SMARTFLEX_PASS.
+#
+# ATENCION, repositorio publico: los logs y artefactos de Actions los puede
+# leer cualquiera. Por eso aqui NO se activa el trace de Playwright, NO se
+# toman capturas, NO se graba video y NO se sube ningun artefacto: un trace
+# guarda los cuerpos de las peticiones, incluido el POST del login. Tampoco
+# uses ACTIONS_STEP_DEBUG en este workflow.
 
 on:
-  schedule:
-    # Cada 30 minutos. Ver INSTRUCCIONES.md sobre minutos de Actions.
-    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: escuchar
+  group: reservar
   cancel-in-progress: false
 
 jobs:
-  escuchar:
+  reservar:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install requests
+
+      - run: pip install requests playwright
+      - run: python -m playwright install --with-deps chromium
+
       - env:
           SMARTFLEX_DOC: ${{ secrets.SMARTFLEX_DOC }}
           SMARTFLEX_EMAIL: ${{ secrets.SMARTFLEX_EMAIL }}
+          SMARTFLEX_USER: ${{ secrets.SMARTFLEX_USER }}
+          SMARTFLEX_PASS: ${{ secrets.SMARTFLEX_PASS }}
           SMARTFLEX_DEVICE_ID: ${{ secrets.SMARTFLEX_DEVICE_ID }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python reservar_smartflex.py --modo escuchar
+        run: python reservar_smartflex.py --modo reservar
 
       - name: Guardar estado
         if: always()
@@ -37,7 +48,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add estado.json
-            git commit -m "estado: comandos procesados"
+            git commit -m "estado: reserva ejecutada"
             git pull --rebase --autostash
             git push
           fi

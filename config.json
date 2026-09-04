@@ -7,10 +7,33 @@
     "19:00",
     "20:00"
   ],
-  "max_clase": null,
+  "max_clase": 16,
   "ventana_comandos_horas": 2,
   "reservar_alternativa": false,
   "sin_clases_domingo": true,
   "sin_clases_festivos": true,
-  "hora_apertura_cupos": "00:15"
+  "hora_apertura_cupos": "00:15",
+  "brightspace": {
+    "base": "https://smartflex.smart.edu.co",
+    "curso_id": 8052,
+    "_comentario": "topics: numero de clase -> TopicId del modulo 'Programa tu clase virtual N'. Si te cambian de curso, saca los nuevos con /d2l/api/le/1.67/<curso_id>/content/toc",
+    "topics": {
+      "1": 228534,
+      "2": 228536,
+      "3": 228538,
+      "4": 228541,
+      "5": 228544,
+      "6": 228546,
+      "7": 228549,
+      "8": 228554,
+      "9": 228550,
+      "10": 228551,
+      "11": 228552,
+      "12": 228553,
+      "13": 228555,
+      "14": 228556,
+      "15": 228557,
+      "16": 228558
+    }
+  }
 }

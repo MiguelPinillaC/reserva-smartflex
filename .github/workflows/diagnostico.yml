@@ -1,21 +1,27 @@
-name: 9. Diagnostico de la API
+name: 4. Diagnostico
+
+# A mano, cuando algo huela raro. Te dice por Telegram que responde hoy la API,
+# incluido el interruptor web/iframe. No reserva ni cancela nada.
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   diagnostico:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install requests
+
       - env:
           SMARTFLEX_DOC: ${{ secrets.SMARTFLEX_DOC }}
           SMARTFLEX_EMAIL: ${{ secrets.SMARTFLEX_EMAIL }}
-          SMARTFLEX_DEVICE_ID: ${{ secrets.SMARTFLEX_DEVICE_ID }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python reservar_smartflex.py --modo diagnostico

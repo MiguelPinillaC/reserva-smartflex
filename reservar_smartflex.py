@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 """
-Reserva Smart Flex — reserva inmediata por chat.
+Reserva Smart Flex — reserva por chat, entrando por donde entra un estudiante.
 
-El sistema del curso no deja programar una clase nueva mientras tengas otra
-sin ver. Como las clases son de 7 a 9 p.m., a medianoche siempre hay una
-pendiente: por eso reservar de madrugada nunca fue posible. El momento util
-es justo despues de terminar la clase.
+Desde agosto de 2026 la institucion apago el agendamiento por web directa y lo
+dejo solo dentro de Brightspace. La API lo dice ella misma:
 
-  --modo escuchar   (cada minuto)  Atiende tus mensajes y reserva de una.
-                                   Tambien ejecuta las citas que dejaste puestas.
-  --modo recordar   (9:20 p.m.)    Si no has programado la de manana, pregunta.
+    getAccessConfig -> {"webBookingEnabled": false, "iframeBookingEnabled": true}
 
-Que le puedes escribir:
+Asi que el bot ya no le habla a la API por su cuenta para ver horarios ni para
+reservar: abre Brightspace con tu usuario, entra al modulo de la clase que
+sigue, y el widget de reservas corre en su iframe real. Se automatiza el clic,
+no el permiso.
 
-  19:00                      reserva la clase siguiente manana a esa hora
-  clase 12 7pm               clase y hora especificas
-  lunes 7pm                  para un dia concreto
-  entra el domingo 00:15     deja una cita: entra ese dia y reserva
-  cancelar / estado / hola
+Eso parte el trabajo en dos, y esa division es la que mantiene esto barato:
 
-Secrets: SMARTFLEX_DOC, SMARTFLEX_EMAIL, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID.
+  --modo escuchar     (cada minuto)   requests puro, ~10 s, SIN contrasena.
+                                      Lee Telegram, responde estado, cancela,
+                                      anota citas y deja ordenes de reserva.
+  --modo recordar     (9:20 p.m.)     requests puro. Pregunta por la de manana.
+  --modo reservar     (por demanda)   Playwright. Ejecuta una orden pendiente.
+  --modo diagnostico  (manual)        requests puro. No reserva nada.
+
+El modo escuchar nunca ve la contrasena. Solo 'reservar' la usa, y solo corre
+cuando hay algo concreto que reservar: un par de veces al dia, no 1.440.
+
+Secrets siempre: SMARTFLEX_DOC, SMARTFLEX_EMAIL, TELEGRAM_TOKEN,
+                 TELEGRAM_CHAT_ID
+Secrets solo en 'reservar': SMARTFLEX_PASS, y SMARTFLEX_USER si tu usuario de
+                 Brightspace no es el documento.
 Opcional: SMARTFLEX_DEVICE_ID.
 """
 
@@ -41,8 +49,7 @@ API = ("https://script.google.com/macros/s/"
 
 TZ = ZoneInfo("America/Bogota")
 TIMEOUT = 20
-INTENTOS = 3
-ESPERA = 15
+ESPERA_UI = 45_000          # ms que le damos a cada paso del widget
 
 CONFIG_FILE = Path("config.json")
 ESTADO_FILE = Path("estado.json")
@@ -59,6 +66,9 @@ MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
 TEXTO_NO = "No reservar"
 TEXTO_CANCELAR = "Cancelar reserva"
 TEXTO_ESTADO = "Ver estado"
+
+# La API contesta esto cuando le pides horarios por fuera del iframe.
+MARCA_BLOQUEO = "deshabilitado"
 
 
 # ---------------------------------------------------------- utilidades
@@ -103,6 +113,38 @@ def device_id():
     nuevo = str(uuid.uuid4())
     DEVICE_FILE.write_text(nuevo)
     return nuevo
+
+
+def avisar_al_workflow(clave, valor="1"):
+    """
+    Deja una senal para el YAML. El paso siguiente la lee y decide si dispara
+    el workflow de reservar. Asi el bucle rapido no necesita el navegador.
+    """
+    salida = os.environ.get("GITHUB_OUTPUT")
+    if not salida:
+        log(f"(senal {clave}={valor}; no estoy en Actions)")
+        return
+    with open(salida, "a", encoding="utf-8") as fh:
+        fh.write(f"{clave}={valor}\n")
+    log(f"senal para el workflow: {clave}={valor}")
+
+
+def normalizar_hora(texto):
+    """'7:00 PM' / '19:00' / '7 pm' -> '19:00'. Devuelve None si no se entiende."""
+    t = str(texto).strip().lower().replace(".", "")
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(a m|p m|am|pm)?", t)
+    if m:
+        h, mi, suf = int(m.group(1)), m.group(2), (m.group(3) or "").replace(" ", "")
+        if suf == "pm" and h != 12:
+            h += 12
+        if suf == "am" and h == 12:
+            h = 0
+        return f"{h:02d}:{mi}"
+    m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
+    if m:
+        h = int(m.group(1)) % 12
+        return f"{h + (12 if m.group(2) == 'pm' else 0):02d}:00"
+    return None
 
 
 # ---------------------------------------------------------- festivos
@@ -157,7 +199,7 @@ def proximo_dia_habil(desde, cfg):
     return desde
 
 
-# ---------------------------------------------------------- API de reservas
+# ---------------------------------------------------------- API ligera
 
 def api_get(action, **params):
     r = requests.get(API, params={"api": "1", "action": action, **params}, timeout=TIMEOUT)
@@ -173,7 +215,15 @@ def api_post(action, **payload):
     return r.json()
 
 
+def bloqueado_por_entorno(resp):
+    """True si la API nos rechazo por no venir del iframe de Brightspace."""
+    if not isinstance(resp, dict) or resp.get("ok") is not False:
+        return False
+    return MARCA_BLOQUEO in str(resp.get("error", "")).lower()
+
+
 def reserva_activa(documento):
+    """Sigue funcionando sin navegador: no depende del modo de entrada."""
     try:
         return api_get("verifyStudentBooking", documento=documento).get("booking")
     except (requests.RequestException, ValueError) as e:
@@ -217,113 +267,10 @@ def bloqueante(b):
     return b if (b and not ya_paso(b)) else None
 
 
-def hora_del_slot(slot):
-    iso = slot.get("isoBogota")
-    if iso:
-        try:
-            return (datetime.fromisoformat(iso.replace("Z", "+00:00"))
-                    .astimezone(TZ).strftime("%H:%M"))
-        except ValueError:
-            pass
-    bruto = (slot.get("timeLabel") or slot.get("timeStr") or "").strip()
-    p = bruto.split(":")
-    return f"{int(p[0]):02d}:{p[1][:2]}" if len(p) >= 2 and p[0].strip().isdigit() else bruto
-
-
-def _slots_de(resp):
-    """Extrae los slots. Devuelve None si la API reporto un error."""
-    if isinstance(resp, dict):
-        if resp.get("ok") is False:
-            log(f"La API respondio error: {resp.get('error', 'sin detalle')}")
-            return None
-        return resp.get("slots") or resp.get("result") or []
-    return resp or []
-
-
-def todos_los_slots(subnivel):
-    """
-    Via principal, la misma del sitio: getAvailableSlots trae todo de una
-    y el filtro por fecha se hace aca. Devuelve None si fallo.
-    """
-    try:
-        s = _slots_de(api_get("getAvailableSlots", subnivel=subnivel))
-        if s is not None:
-            log(f"getAvailableSlots({subnivel}): {len(s)} horarios en total")
-        return s
-    except (requests.RequestException, ValueError) as e:
-        log(f"getAvailableSlots fallo: {e}")
-        return None
-
-
-def fechas_con_cupo(subnivel):
-    """dateStr -> lista de slots. Sirve para decir que dias si tienen."""
-    todos = todos_los_slots(subnivel)
-    mapa = {}
-    for s in todos or []:
-        d = str(s.get("dateStr", "")).strip()
-        if d:
-            mapa.setdefault(d, []).append(s)
-    return mapa
-
-
-def obtener_slots(subnivel, fecha):
-    todos = todos_los_slots(subnivel)
-    if todos:
-        propios = [s for s in todos if str(s.get("dateStr", "")).strip() == fecha]
-        log(f"  de esos, {len(propios)} son del {fecha}")
-        return propios
-
-    # Respaldo: el endpoint por fecha.
-    try:
-        s = _slots_de(api_get("getSlotsForDate", subnivel=subnivel, dateStr=fecha))
-        log(f"getSlotsForDate({subnivel}, {fecha}): {len(s) if s else 0} horarios")
-        return s or []
-    except (requests.RequestException, ValueError) as e:
-        log(f"getSlotsForDate fallo: {e}")
-        return []
-
-
-# ---------------------------------------------------------- Telegram entrante
-
-def obtener_updates(limite=60):
-    if not TG_TOKEN or not TG_CHAT:
-        return []
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
-                         params={"limit": limite}, timeout=TIMEOUT)
-        return r.json().get("result", [])
-    except (requests.RequestException, ValueError) as e:
-        log(f"No pude leer Telegram: {e}")
-        return []
-
-
-def mensajes_mios(updates):
-    salida = []
-    for u in updates:
-        msg = u.get("message") or {}
-        if str(msg.get("chat", {}).get("id")) != str(TG_CHAT):
-            continue
-        texto = (msg.get("text") or "").strip()
-        if texto:
-            salida.append({"id": u.get("update_id", 0),
-                           "fecha": msg.get("date", 0), "texto": texto})
-    if salida:
-        log(f"<- {len(salida)} mensaje(s)"
-            + (f": {[m['texto'] for m in salida]}" if DETALLE else ""))
-    return salida
-
-
 # ---------------------------------------------------------- interpretacion
 
 def interpretar_hora(t):
-    m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
-    if m:
-        return f"{int(m.group(1)):02d}:{m.group(2)}"
-    m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
-    if m:
-        h = int(m.group(1)) % 12
-        return f"{h + (12 if m.group(2) == 'pm' else 0):02d}:00"
-    return None
+    return normalizar_hora(t)
 
 
 def interpretar_dia(t, ahora=None):
@@ -358,7 +305,7 @@ def interpretar_dia(t, ahora=None):
 def interpretar(texto, base):
     """
     Devuelve (parametros, veredicto):
-      'si'   trae datos concretos -> reservar de una
+      'si'   trae datos concretos -> dejar orden de reserva
       'menu' dijo que si, pero sin decir que -> hay que preguntarle
       'no'   dijo que no
       '?'    no se entiende
@@ -415,85 +362,39 @@ def proxima_clase(cfg, estado, activa):
     return subnivel, str(siguiente), False
 
 
-# ---------------------------------------------------------- reserva inmediata
+# ---------------------------------------------------------- ordenes
 
-def reservar_ahora(cfg, estado, documento, subnivel, clase, hora, fecha_obj):
-    """Reserva ya mismo. Devuelve True si quedo."""
-    motivo = sin_clases(fecha_obj, cfg)
-    if motivo:
-        alterno = proximo_dia_habil(fecha_obj + timedelta(days=1), cfg)
-        enviar(f"El {fecha_bonita(fecha_obj)} no hay clases porque {motivo}.\n"
-               f"El siguiente dia habil es el {fecha_bonita(alterno)}. "
-               "Escribeme la hora si quieres que lo intente ahi.")
-        return False
+def poner_orden(estado, subnivel, clase, hora, fecha, accion="reservar"):
+    """
+    Una orden es lo unico que el bucle rapido le deja al de navegador.
+    Se guarda en estado.json y el workflow dispara 'reservar' al verla.
+    """
+    estado["orden"] = {
+        "accion": accion,
+        "subnivel": subnivel,
+        "clase": str(clase),
+        "hora": hora,
+        "fecha": fecha.strftime("%Y-%m-%d") if hasattr(fecha, "strftime") else fecha,
+        "creada": datetime.now(TZ).strftime("%Y-%m-%d %H:%M"),
+    }
+    guardar_estado(estado)
+    avisar_al_workflow("reservar", "1")
 
-    activa = reserva_activa(documento)
-    if bloqueante(activa):
-        cuando = fecha_de_reserva(activa)
-        enviar("No puedo reservar todavia: tienes una clase pendiente sin ver.\n"
-               f"{describir(activa)}\n\n"
-               + (f"Escribeme despues de las {(cuando + timedelta(hours=2)):%H:%M} "
-                  "y la programo de una." if cuando else
-                  "Escribeme cuando ya la hayas visto."))
-        return False
 
-    email = os.environ.get("SMARTFLEX_EMAIL", "").strip()
-    if not email:
-        enviar("No reserve: falta el secret SMARTFLEX_EMAIL.")
-        return False
-
-    sesion = api_get("login", documento=documento)
-    if not sesion.get("ok"):
-        enviar(f"El sistema rechazo el ingreso: {sesion.get('error','sin detalle')}")
-        return False
-    nombre = sesion.get("nombreCompleto", "")
-
-    fecha = fecha_obj.strftime("%Y-%m-%d")
-    alternativa = bool(cfg.get("reservar_alternativa", False))
-    ultimo_error = None
-
-    for intento in range(1, INTENTOS + 1):
-        try:
-            disponibles = {hora_del_slot(s): s for s in obtener_slots(subnivel, fecha)}
-            log(f"Intento {intento} para {fecha}: {sorted(disponibles) or 'sin horas'}")
-
-            elegido, hora_final = disponibles.get(hora), hora
-            if not elegido and alternativa and disponibles:
-                hora_final = sorted(disponibles)[0]
-                elegido = disponibles[hora_final]
-
-            if elegido:
-                res = api_post("book", subnivel=subnivel, slotId=elegido.get("slotId"),
-                               email=email, clase=clase,
-                               slotIso=elegido.get("isoBogota", ""),
-                               userTz="America/Bogota", dispositivo_id=device_id(),
-                               documento=documento, name=nombre)
-                if res.get("ok"):
-                    if str(clase).isdigit():
-                        estado["ultima_clase_reservada"] = int(clase)
-                        estado["subnivel"] = subnivel
-                    guardar_estado(estado)
-                    extra = "" if hora_final == hora else f"\n(no habia a las {hora}, tome esta)"
-                    enviar(f"RESERVADO\n{subnivel} clase {clase}\n"
-                           f"{fecha_bonita(fecha_obj)} a las {hora_final}\n"
-                           f"id: {res.get('bookingId','')}{extra}")
-                    return True
-                if res.get("booking"):
-                    enviar("No reserve: el sistema reporta una reserva activa tuya.")
-                    return False
-                ultimo_error = res.get("error", "rechazado sin detalle")
-            else:
-                ultimo_error = (f"no hay cupo a las {hora}. Disponibles: "
-                                f"{', '.join(sorted(disponibles)) if disponibles else 'ninguna'}")
-        except requests.RequestException as e:
-            ultimo_error = f"error de conexion ({e})"
-
-        if intento < INTENTOS:
-            time.sleep(ESPERA)
-
-    enviar(f"NO RESERVADO\n{subnivel} clase {clase} - {fecha_bonita(fecha_obj)} a las {hora}\n"
-           f"Motivo: {ultimo_error}\n(ejecutado {datetime.now(TZ):%H:%M})")
-    return False
+def orden_vigente(estado):
+    o = estado.get("orden")
+    if not o:
+        return None
+    try:
+        creada = datetime.strptime(o["creada"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except (ValueError, KeyError, TypeError):
+        return o
+    if datetime.now(TZ) - creada > timedelta(hours=6):
+        log("Orden vieja, la descarto.")
+        estado["orden"] = None
+        guardar_estado(estado)
+        return None
+    return o
 
 
 # ---------------------------------------------------------- citas programadas
@@ -524,24 +425,276 @@ def cita_pendiente(estado):
     return c
 
 
-def ejecutar_cita(cfg, estado, documento, c):
-    log(f"Ejecutando cita de las {c['cuando']}")
-    activa = reserva_activa(documento)
-    s, cl, _ = proxima_clase(cfg, estado, activa)
-    subnivel = c.get("subnivel") or s
-    clase = c.get("clase") or cl
-    hora = c.get("hora") or cfg["hora"]
-    fecha = (datetime.strptime(c["para"], "%Y-%m-%d").date() if c.get("para")
-             else datetime.now(TZ).date() + timedelta(days=1))
+def describir_cita(c):
+    try:
+        cuando = datetime.strptime(c["cuando"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        entrada = f"{fecha_bonita(cuando)} a las {cuando:%H:%M}"
+    except (ValueError, KeyError, TypeError):
+        entrada = str(c.get("cuando", "?"))
 
-    estado["cita"] = None
+    que = f"{c.get('subnivel') or ''} clase {c.get('clase') or '?'}".strip()
+
+    if c.get("para"):
+        try:
+            destino = datetime.strptime(c["para"], "%Y-%m-%d").date()
+            que += f" para el {fecha_bonita(destino)}"
+        except ValueError:
+            pass
+
+    que += f" a las {c['hora']}" if c.get("hora") else " (falta la hora)"
+    return f"Entro el {entrada}\ny busco {que}."
+
+
+def etiqueta_dia(d):
+    hoy = datetime.now(TZ).date()
+    if d == hoy:
+        return "hoy"
+    if d == hoy + timedelta(days=1):
+        return "manana"
+    return DIAS[d.weekday()]
+
+
+def apertura_de(fecha, cfg):
+    """Cuando abren los cupos de esa fecha: la madrugada anterior."""
+    vispera = fecha - timedelta(days=1)
+    hhmm = str(cfg.get("hora_apertura_cupos", "00:15"))
+    try:
+        return datetime.strptime(f"{vispera} {hhmm}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        return datetime.strptime(f"{vispera} 00:15", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+
+
+# ---------------------------------------------------------- el navegador
+
+def _buscar_frame(pagina, fragmento, segundos=40):
+    """
+    El widget vive en un iframe anidado dentro del visor de contenido de D2L.
+    Buscarlo por URL en pagina.frames aguanta cualquier profundidad.
+    """
+    limite = time.time() + segundos
+    while time.time() < limite:
+        for f in pagina.frames:
+            if fragmento in (f.url or ""):
+                return f
+        pagina.wait_for_timeout(500)
+    return None
+
+
+def _entrar_a_brightspace(pagina, bs):
+    usuario = os.environ.get("SMARTFLEX_USER") or os.environ.get("SMARTFLEX_DOC", "")
+    clave = os.environ.get("SMARTFLEX_PASS", "")
+    if not clave:
+        raise RuntimeError("falta el secret SMARTFLEX_PASS")
+
+    pagina.goto(f'{bs["base"]}/d2l/login', wait_until="domcontentloaded", timeout=ESPERA_UI)
+    pagina.fill("#userName", usuario)
+    pagina.fill("#password", clave)          # nunca por URL, nunca a los logs
+    pagina.click("button:has-text('Iniciar sesión')")
+    pagina.wait_for_load_state("networkidle", timeout=ESPERA_UI)
+
+    if "/d2l/login" in pagina.url:
+        raise RuntimeError("Brightspace no acepto el usuario o la contrasena")
+    log("Dentro de Brightspace")
+
+
+def _abrir_widget(pagina, bs, clase):
+    topics = bs.get("topics") or {}
+    topic = topics.get(str(clase))
+    if not topic:
+        raise RuntimeError(f"no tengo el id del modulo de la clase {clase} "
+                           f"(agregalo en config.json -> brightspace.topics)")
+
+    url = f'{bs["base"]}/d2l/le/content/{bs["curso_id"]}/viewContent/{topic}/View'
+    pagina.goto(url, wait_until="domcontentloaded", timeout=ESPERA_UI)
+
+    w = _buscar_frame(pagina, "reservas-smartflex")
+    if w is None:
+        raise RuntimeError("el modulo cargo pero no aparecio el widget de reservas")
+
+    documento = os.environ.get("SMARTFLEX_DOC", "")
+    w.wait_for_selector("#loginDoc", timeout=ESPERA_UI)
+    w.fill("#loginDoc", documento)
+    w.click("#loginBtn")
+    w.wait_for_selector("#appContainer", state="visible", timeout=ESPERA_UI)
+    log(f"Widget abierto en la clase {clase}")
+    return w
+
+
+def _horas_ofrecidas(w):
+    """Lee las tarjetas de horario y las devuelve como {'19:00': indice}."""
+    tarjetas = w.locator("#slotsList div[data-slotid]")
+    salida = {}
+    for i in range(tarjetas.count()):
+        try:
+            crudo = tarjetas.nth(i).locator(".slot-time-main").inner_text(timeout=5000)
+        except Exception:
+            continue
+        h = normalizar_hora(crudo)
+        if h:
+            salida[h] = i
+    return salida
+
+
+def ejecutar_orden(cfg, estado, documento, orden):
+    """Abre el navegador y hace UNA cosa: la orden pendiente."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        enviar("No reserve: falta instalar Playwright en el workflow.")
+        return False
+
+    bs = cfg.get("brightspace") or {}
+    if not bs.get("base") or not bs.get("curso_id"):
+        enviar("No reserve: falta la seccion 'brightspace' en config.json.")
+        return False
+
+    subnivel = orden.get("subnivel") or cfg["subnivel"]
+    clase = str(orden.get("clase") or cfg["clase"])
+    hora = orden.get("hora") or cfg["hora"]
+    fecha = orden.get("fecha")
+    email = os.environ.get("SMARTFLEX_EMAIL", "").strip()
+
+    if not email:
+        enviar("No reserve: falta el secret SMARTFLEX_EMAIL.")
+        return False
+
+    with sync_playwright() as p:
+        nav = p.chromium.launch(args=["--no-sandbox"])
+        ctx = nav.new_context(locale="es-CO", timezone_id="America/Bogota",
+                              viewport={"width": 1280, "height": 900})
+        pagina = ctx.new_page()
+        try:
+            _entrar_a_brightspace(pagina, bs)
+            w = _abrir_widget(pagina, bs, clase)
+
+            if orden.get("accion") == "cancelar":
+                return _cancelar_en_widget(w, estado, documento)
+
+            w.click("#btnProgramar")
+            w.wait_for_selector("#datesList .card", timeout=ESPERA_UI)
+
+            boton_fecha = w.locator(f'#datesList button[onclick*="{fecha}"]')
+            if boton_fecha.count() == 0:
+                disponibles = re.findall(r"loadSlots\('([\d-]+)'\)",
+                                         w.locator("#datesList").inner_html())
+                _avisar_sin_fecha(fecha, sorted(set(disponibles)))
+                return False
+
+            boton_fecha.first.click()
+            w.wait_for_selector("#slotsList div[data-slotid]", timeout=ESPERA_UI)
+
+            opciones = _horas_ofrecidas(w)
+            log(f"Horas para el {fecha}: {sorted(opciones) or 'ninguna'}")
+
+            elegida = hora
+            if hora not in opciones:
+                if not cfg.get("reservar_alternativa", False) or not opciones:
+                    _avisar_sin_hora(fecha, hora, sorted(opciones))
+                    return False
+                elegida = sorted(opciones)[0]
+
+            tarjeta = w.locator("#slotsList div[data-slotid]").nth(opciones[elegida])
+            tarjeta.locator(".btn-reserve").click()
+
+            w.wait_for_selector("#bookingForm", timeout=ESPERA_UI)
+            campo = w.locator("#email")
+            if not (campo.input_value() or "").strip():
+                campo.fill(email)
+            w.click("#confirmBtn")
+            w.wait_for_timeout(6000)
+
+            return _confirmar_resultado(estado, documento, subnivel, clase,
+                                        fecha, elegida, hora)
+        except Exception as e:
+            # Sin volcados de pagina: los logs de un repo publico los lee cualquiera.
+            enviar(f"NO RESERVADO\n{subnivel} clase {clase} - {fecha} a las {hora}\n"
+                   f"Motivo: {type(e).__name__}: {str(e)[:200]}\n"
+                   f"(ejecutado {datetime.now(TZ):%H:%M})")
+            return False
+        finally:
+            ctx.close()
+            nav.close()
+
+
+def _avisar_sin_fecha(fecha, disponibles):
+    if disponibles:
+        lineas = []
+        for d in disponibles[:6]:
+            try:
+                lineas.append("  " + fecha_bonita(datetime.strptime(d, "%Y-%m-%d").date()))
+            except ValueError:
+                lineas.append("  " + d)
+        enviar(f"NO RESERVADO\nNo hay cupo para el {fecha}, pero si para:\n"
+               + "\n".join(lineas)
+               + "\n\nEscribeme por ejemplo 'viernes 7pm' y lo tomo.")
+    else:
+        enviar(f"NO RESERVADO\nNo hay ninguna fecha con cupo todavia.\n"
+               f"(revisado {datetime.now(TZ):%H:%M})")
+
+
+def _avisar_sin_hora(fecha, hora, disponibles):
+    if disponibles:
+        enviar(f"NO RESERVADO\nNo hay cupo a las {hora} el {fecha}.\n"
+               f"Libres: {', '.join(disponibles)}\n\n"
+               "Toca una y la reservo.",
+               botones=[disponibles[i:i + 3] for i in range(0, len(disponibles[:9]), 3)]
+                       + [[TEXTO_NO, TEXTO_ESTADO]])
+    else:
+        enviar(f"NO RESERVADO\nNo quedan horas libres el {fecha}.")
+
+
+def _confirmar_resultado(estado, documento, subnivel, clase, fecha, elegida, pedida):
+    """
+    La verdad no la da el HTML del modal, la da la API: verifyStudentBooking
+    sigue respondiendo sin navegador y es la misma fuente que usa el sistema.
+    """
+    time.sleep(3)
+    activa = reserva_activa(documento)
+    ok = bool(activa and str(activa.get("clase", "")).strip() == str(clase))
+
+    estado["orden"] = None
+    if ok:
+        if str(clase).isdigit():
+            estado["ultima_clase_reservada"] = int(clase)
+            estado["subnivel"] = subnivel
+        guardar_estado(estado)
+        extra = "" if elegida == pedida else f"\n(no habia a las {pedida}, tome esta)"
+        enviar(f"RESERVADO\n{subnivel} clase {clase}\n{fecha} a las {elegida}{extra}\n"
+               f"({describir(activa)})")
+        return True
+
     guardar_estado(estado)
-    reservar_ahora(cfg, estado, documento, subnivel, clase, hora, fecha)
+    enviar(f"NO RESERVADO\n{subnivel} clase {clase} - {fecha} a las {elegida}\n"
+           "El widget no confirmo la reserva. Revisa desde Brightspace.")
+    return False
+
+
+def _cancelar_en_widget(w, estado, documento):
+    w.click("#btnCancelar")
+    w.wait_for_selector("#confirmCancelBtn", timeout=ESPERA_UI)
+    w.click("#confirmCancelBtn")
+    w.wait_for_timeout(5000)
+
+    estado["orden"] = None
+    if reserva_activa(documento) is None:
+        ultima = estado.get("ultima_clase_reservada")
+        if isinstance(ultima, int):
+            estado["ultima_clase_reservada"] = (ultima - 1) or None
+        guardar_estado(estado)
+        enviar("CANCELADO\nTu cupo quedo liberado.")
+        return True
+    guardar_estado(estado)
+    enviar("No pude confirmar la cancelacion. Revisa desde Brightspace.")
+    return False
 
 
 # ---------------------------------------------------------- mensajes
 
 def menu(cfg, estado, documento, encabezado):
+    """
+    Sin navegador no podemos listar horas reales, asi que ofrecemos las
+    sugeridas y la confirmacion real llega cuando corre 'reservar'.
+    """
     activa = reserva_activa(documento)
     if bloqueante(activa):
         cuando = fecha_de_reserva(activa)
@@ -564,111 +717,20 @@ def menu(cfg, estado, documento, encabezado):
     if objetivo != manana:
         nota = f"\n(manana no hay clases porque {sin_clases(manana, cfg)})"
 
-    cabeza = (f"{encabezado}\n\n{subnivel} clase {clase}\n"
-              f"Reservaria para el {fecha_bonita(objetivo)}.{nota}")
-
-    # Horas reales del sistema, no una lista fija.
-    try:
-        reales = sorted({hora_del_slot(s)
-                         for s in obtener_slots(subnivel, objetivo.strftime("%Y-%m-%d"))})
-    except (requests.RequestException, ValueError) as e:
-        log(f"No pude consultar horarios: {e}")
-        reales = None
-
-    if reales is None:
-        sugeridas = cfg.get("horas_sugeridas") or [cfg["hora"]]
-        botones = [sugeridas[i:i + 3] for i in range(0, len(sugeridas), 3)]
-        botones.append([TEXTO_NO, TEXTO_ESTADO])
-        enviar(f"{cabeza}\n\nNo pude consultar los horarios ahora. "
-               "Dime una hora e igual lo intento.", botones=botones)
-        return
-
-    if not reales:
-        mapa = fechas_con_cupo(subnivel)
-        otras = sorted(d for d in mapa if d > datetime.now(TZ).strftime("%Y-%m-%d"))
-
-        if otras:
-            lineas = []
-            for d in otras[:5]:
-                horas = sorted({hora_del_slot(s) for s in mapa[d]})
-                fecha_d = datetime.strptime(d, "%Y-%m-%d").date()
-                lineas.append(f"  {fecha_bonita(fecha_d)}: {', '.join(horas[:6])}")
-            enviar(f"{cabeza}\n\nNo hay cupo para ese dia, pero si para estos:\n"
-                   + "\n".join(lineas)
-                   + "\n\nEscribeme por ejemplo 'viernes 7pm' y lo tomo.",
-                   botones=[[TEXTO_NO, TEXTO_ESTADO]])
-            return
-
-        abren = apertura_de(objetivo, cfg)
-        if abren > datetime.now(TZ):
-            comando = f"entra {etiqueta_dia(abren.date())} {abren:%H:%M}"
-            enviar(f"{cabeza}\n\nNo hay horarios todavia: los cupos abren el "
-                   f"{fecha_bonita(abren)} a las {abren:%H:%M}.\n\n"
-                   f"Escribeme '{comando}' y lo busco apenas los abran.",
-                   botones=[[comando], [TEXTO_ESTADO]])
-        else:
-            enviar(f"{cabeza}\n\nEl sistema no esta devolviendo ningun horario, "
-                   "ni para ese dia ni para ningun otro. Puede ser una falla "
-                   "temporal: intenta desde la pagina del curso a ver si tu si los ves.",
-                   botones=[[TEXTO_ESTADO]])
-        return
-
-    visibles = reales[:9]
-    botones = [visibles[i:i + 3] for i in range(0, len(visibles), 3)]
+    sugeridas = cfg.get("horas_sugeridas") or [cfg["hora"]]
+    botones = [sugeridas[i:i + 3] for i in range(0, len(sugeridas), 3)]
     botones.append([TEXTO_NO, TEXTO_ESTADO])
-    enviar(f"{cabeza}\n\nHoras libres: {', '.join(reales)}\n"
-           "Toca una y la reservo de una.", botones=botones)
+    enviar(f"{encabezado}\n\n{subnivel} clase {clase}\n"
+           f"Reservaria para el {fecha_bonita(objetivo)}.{nota}\n\n"
+           "Toca una hora y entro a Brightspace a reservarla.", botones=botones)
 
 
 PATRON_ESTADO = r"(estado|ver estado|que tengo|qué tengo|mi reserva|mis reservas)"
 PATRON_CANCELAR = r"(cancelar|cancela|cancelar clase|cancelar reserva)"
 
 
-def etiqueta_dia(d):
-    """'hoy', 'manana' o el nombre del dia. Lo entiende interpretar_dia."""
-    hoy = datetime.now(TZ).date()
-    if d == hoy:
-        return "hoy"
-    if d == hoy + timedelta(days=1):
-        return "manana"
-    return DIAS[d.weekday()]
-
-
-def apertura_de(fecha, cfg):
-    """Cuando abren los cupos de esa fecha: la madrugada anterior."""
-    vispera = fecha - timedelta(days=1)
-    hhmm = str(cfg.get("hora_apertura_cupos", "00:15"))
-    try:
-        return datetime.strptime(f"{vispera} {hhmm}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-    except ValueError:
-        return datetime.strptime(f"{vispera} 00:15", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-
-
-def describir_cita(c):
-    """
-    Frase unica para la cita. La usan tanto la confirmacion como el estado,
-    para que el mismo dato nunca se cuente de dos formas distintas.
-    """
-    try:
-        cuando = datetime.strptime(c["cuando"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-        entrada = f"{fecha_bonita(cuando)} a las {cuando:%H:%M}"
-    except (ValueError, KeyError, TypeError):
-        entrada = str(c.get("cuando", "?"))
-
-    que = f"{c.get('subnivel') or ''} clase {c.get('clase') or '?'}".strip()
-
-    if c.get("para"):
-        try:
-            destino = datetime.strptime(c["para"], "%Y-%m-%d").date()
-            que += f" para el {fecha_bonita(destino)}"
-        except ValueError:
-            pass
-
-    que += f" a las {c['hora']}" if c.get("hora") else " (falta la hora)"
-    return f"Entro el {entrada}\ny busco {que}."
-
-
 def cancelar(documento, estado):
+    """Primero por API. Si la bloquean, se lo dejamos al navegador."""
     activa = reserva_activa(documento)
     if not activa:
         enviar("No tienes ninguna reserva activa para cancelar.")
@@ -677,17 +739,30 @@ def cancelar(documento, estado):
         enviar(f"No cancele nada: esa clase ya se dicto.\n{describir(activa)}\n"
                "El sistema la sigue mostrando, pero no te bloquea.")
         return
-    res = api_post("cancel", bookingId=activa.get("bookingId"),
-                   token=activa.get("cancelToken", ""), source="telegram_bot")
+
+    try:
+        res = api_post("cancel", bookingId=activa.get("bookingId"),
+                       token=activa.get("cancelToken", ""), source="telegram_bot")
+    except (requests.RequestException, ValueError) as e:
+        log(f"cancel fallo: {e}")
+        res = {"ok": False, "error": str(e)}
+
     if res.get("ok"):
         clase = str(activa.get("clase", "")).strip()
         if clase.isdigit() and estado.get("ultima_clase_reservada") == int(clase):
             estado["ultima_clase_reservada"] = int(clase) - 1 or None
             guardar_estado(estado)
         enviar(f"CANCELADO\n{describir(activa)}\nTu cupo quedo liberado.")
-    else:
-        enviar(f"No pude cancelar: {res.get('error','sin detalle')}\n"
-               "Puedes hacerlo desde la pagina del curso.")
+        return
+
+    if bloqueado_por_entorno(res):
+        poner_orden(estado, activa.get("subnivel"), activa.get("clase"),
+                    None, None, accion="cancelar")
+        enviar("Cancelando desde Brightspace, dame un minuto.")
+        return
+
+    enviar(f"No pude cancelar: {res.get('error','sin detalle')}\n"
+           "Puedes hacerlo desde la pagina del curso.")
 
 
 def contar_estado(cfg, estado, documento):
@@ -699,6 +774,12 @@ def contar_estado(cfg, estado, documento):
         partes.append(f"Tu ultima clase fue:\n{describir(activa)}")
     else:
         partes.append("No tienes ninguna reserva en el sistema.")
+
+    o = estado.get("orden")
+    if o:
+        partes.append(f"Orden en curso:\n{o.get('accion')} {o.get('subnivel','')} "
+                      f"clase {o.get('clase','?')} el {o.get('fecha','?')} "
+                      f"a las {o.get('hora','?')}")
 
     c = estado.get("cita")
     if c and c.get("cuando"):
@@ -769,14 +850,42 @@ def atender(cfg, estado, documento, texto):
     else:
         objetivo = proximo_dia_habil(datetime.now(TZ).date() + timedelta(days=1), cfg)
 
-    reservar_ahora(cfg, estado, documento, params["subnivel"], str(params["clase"]),
-                   params["hora"], objetivo)
+    motivo = sin_clases(objetivo, cfg)
+    if motivo:
+        alterno = proximo_dia_habil(objetivo + timedelta(days=1), cfg)
+        enviar(f"El {fecha_bonita(objetivo)} no hay clases porque {motivo}.\n"
+               f"El siguiente dia habil es el {fecha_bonita(alterno)}. "
+               "Escribeme la hora si quieres que lo intente ahi.")
+        return
+
+    if bloqueante(activa):
+        cuando = fecha_de_reserva(activa)
+        enviar("No puedo reservar todavia: tienes una clase pendiente sin ver.\n"
+               f"{describir(activa)}\n\n"
+               + (f"Escribeme despues de las {(cuando + timedelta(hours=2)):%H:%M} "
+                  "y la programo de una." if cuando else
+                  "Escribeme cuando ya la hayas visto."))
+        return
+
+    poner_orden(estado, params["subnivel"], str(params["clase"]),
+                params["hora"], objetivo)
+    enviar(f"Voy por {params['subnivel']} clase {params['clase']} el "
+           f"{fecha_bonita(objetivo)} a las {params['hora']}.\n"
+           "Entro a Brightspace y te confirmo en un minuto.")
 
 
 def modo_escuchar(cfg, estado, documento):
+    """Cada minuto. Nunca abre el navegador y nunca ve la contrasena."""
     c = cita_pendiente(estado)
     if c:
-        ejecutar_cita(cfg, estado, documento, c)
+        log(f"Convierto la cita de las {c['cuando']} en orden")
+        activa = reserva_activa(documento)
+        s, cl, _ = proxima_clase(cfg, estado, activa)
+        fecha = (datetime.strptime(c["para"], "%Y-%m-%d").date() if c.get("para")
+                 else datetime.now(TZ).date() + timedelta(days=1))
+        estado["cita"] = None
+        poner_orden(estado, c.get("subnivel") or s, c.get("clase") or cl,
+                    c.get("hora") or cfg["hora"], fecha)
 
     ultimo_visto = int(estado.get("ultimo_update_procesado", 0))
     limite = time.time() - float(cfg.get("ventana_comandos_horas", 2)) * 3600
@@ -789,6 +898,16 @@ def modo_escuchar(cfg, estado, documento):
     estado["ultimo_update_procesado"] = max(m["id"] for m in nuevos)
     guardar_estado(estado)
     atender(cfg, estado, documento, nuevos[-1]["texto"])
+
+
+def modo_reservar(cfg, estado, documento):
+    """Lo dispara el workflow de escuchar cuando hay una orden pendiente."""
+    orden = orden_vigente(estado)
+    if not orden:
+        log("No hay ninguna orden pendiente. Nada que hacer.")
+        return
+    log(f"Ejecutando orden: {orden}")
+    ejecutar_orden(cfg, estado, documento, orden)
 
 
 def modo_recordar(cfg, estado, documento):
@@ -816,48 +935,84 @@ def modo_recordar(cfg, estado, documento):
     menu(cfg, estado, documento, "Ya termino tu clase. Quieres programar la de manana?")
 
 
-
 def modo_diagnostico(cfg, estado, documento):
-    """Muestra que devuelve de verdad la API. No reserva nada."""
+    """Que responde de verdad la API hoy. No reserva nada."""
     subnivel = cfg["subnivel"]
     activa = reserva_activa(documento)
     if activa:
         subnivel = activa.get("subnivel") or subnivel
     lineas = [f"Diagnostico para subnivel {subnivel}"]
 
+    try:
+        acc = api_get("getAccessConfig")
+        lineas.append(f"getAccessConfig: web={acc.get('webBookingEnabled')} "
+                      f"iframe={acc.get('iframeBookingEnabled')}")
+    except (requests.RequestException, ValueError) as e:
+        lineas.append(f"getAccessConfig: fallo ({e})")
+
     for accion, params in [("getAvailableSlots", {"subnivel": subnivel}),
-                           ("getSlotsForDate", {"subnivel": subnivel,
-                                                "dateStr": (datetime.now(TZ).date()
-                                                            + timedelta(days=1)).strftime("%Y-%m-%d")})]:
+                           ("verifyStudentBooking", {"documento": documento})]:
         try:
             resp = api_get(accion, **params)
         except (requests.RequestException, ValueError) as e:
             lineas.append(f"{accion}: fallo ({e})")
             continue
-
-        if isinstance(resp, dict):
-            lineas.append(f"{accion}: claves {sorted(resp.keys())}")
-            if resp.get("ok") is False:
-                lineas.append(f"  error: {resp.get('error','sin detalle')}")
-            slots = resp.get("slots") or resp.get("result") or []
+        if bloqueado_por_entorno(resp):
+            lineas.append(f"{accion}: bloqueado fuera del iframe (esperado)")
+        elif isinstance(resp, dict) and resp.get("ok") is False:
+            lineas.append(f"{accion}: error - {resp.get('error','sin detalle')[:80]}")
         else:
-            slots = resp or []
-            lineas.append(f"{accion}: lista de {len(slots)}")
+            slots = resp.get("slots") or resp.get("result") or []
+            lineas.append(f"{accion}: ok ({len(slots)} elementos)" if slots
+                          else f"{accion}: ok")
 
-        lineas.append(f"  {len(slots)} horarios")
-        if slots:
-            lineas.append(f"  campos: {sorted(slots[0].keys())}")
-            fechas = sorted({str(s.get('dateStr','?')) for s in slots})
-            lineas.append(f"  fechas: {', '.join(fechas[:8])}")
+    bs = cfg.get("brightspace") or {}
+    lineas.append(f"brightspace: curso {bs.get('curso_id','?')}, "
+                  f"{len(bs.get('topics') or {})} clases mapeadas")
+    o = estado.get("orden")
+    lineas.append(f"orden pendiente: {o.get('accion')} clase {o.get('clase')}" if o
+                  else "orden pendiente: ninguna")
 
     texto = "\n".join(lineas)
     log(texto.replace("\n", " | "))
     enviar(texto)
 
 
+# ---------------------------------------------------------- Telegram entrante
+
+def obtener_updates(limite=60):
+    if not TG_TOKEN or not TG_CHAT:
+        return []
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+                         params={"limit": limite}, timeout=TIMEOUT)
+        return r.json().get("result", [])
+    except (requests.RequestException, ValueError) as e:
+        log(f"No pude leer Telegram: {e}")
+        return []
+
+
+def mensajes_mios(updates):
+    salida = []
+    for u in updates:
+        msg = u.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(TG_CHAT):
+            continue
+        texto = (msg.get("text") or "").strip()
+        if texto:
+            salida.append({"id": u.get("update_id", 0),
+                           "fecha": msg.get("date", 0), "texto": texto})
+    if salida:
+        log(f"<- {len(salida)} mensaje(s)"
+            + (f": {[m['texto'] for m in salida]}" if DETALLE else ""))
+    return salida
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--modo", choices=["escuchar", "recordar", "diagnostico"], required=True)
+    ap.add_argument("--modo",
+                    choices=["escuchar", "reservar", "recordar", "diagnostico"],
+                    required=True)
     args = ap.parse_args()
 
     documento = os.environ.get("SMARTFLEX_DOC")
@@ -867,7 +1022,7 @@ def main():
 
     cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     base = {"ultima_clase_reservada": None, "subnivel": cfg["subnivel"],
-            "ultimo_update_procesado": 0, "cita": None}
+            "ultimo_update_procesado": 0, "cita": None, "orden": None}
     estado = base
     if ESTADO_FILE.exists():
         try:
@@ -875,8 +1030,9 @@ def main():
         except ValueError:
             log("estado.json ilegible, uso valores por defecto.")
 
-    {"escuchar": modo_escuchar, "recordar": modo_recordar,
-     "diagnostico": modo_diagnostico}[args.modo](cfg, estado, documento)
+    {"escuchar": modo_escuchar, "reservar": modo_reservar,
+     "recordar": modo_recordar, "diagnostico": modo_diagnostico}[args.modo](
+        cfg, estado, documento)
 
 
 if __name__ == "__main__":

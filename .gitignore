@@ -1,3 +1,4 @@
 .device_id
 __pycache__/
 *.pyc
+Claude outputs/
