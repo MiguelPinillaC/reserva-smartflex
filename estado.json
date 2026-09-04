@@ -1,7 +1,14 @@
 {
   "ultima_clase_reservada": 11,
   "subnivel": "A1.2",
-  "ultimo_update_procesado": 309237256,
+  "ultimo_update_procesado": 309237257,
   "cita": null,
-  "orden": null
+  "orden": {
+    "accion": "reservar",
+    "subnivel": "A1.2",
+    "clase": "13",
+    "hora": "19:00",
+    "fecha": "2026-09-04",
+    "creada": "2026-09-03 23:09"
+  }
 }
